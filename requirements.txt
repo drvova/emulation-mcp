@@ -1,0 +1,4 @@
+fastmcp>=2.0.0
+unicorn>=2.1.0
+qiling>=1.4.6
+capstone>=5.0.0
