@@ -93,6 +93,18 @@ class TestUnicornThroughServer(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
+    def test_icicle_only_tools_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            for out in (
+                _fn(server.emu_breakpoint_add)(sid, "0x1000000"),
+                _fn(server.emu_list_registers)(sid),
+                _fn(server.emu_memory_unmap)(sid, "0x1000000", 0x1000),
+            ):
+                self.assertIn("not supported", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
 
 @unittest.skipUnless(HAS_ICICLE, "icicle not installed")
 class TestIcicleThroughServer(unittest.TestCase):
@@ -120,6 +132,44 @@ class TestIcicleThroughServer(unittest.TestCase):
             arch="x86_64", code_hex="48c7c0410000009090", engine="icicle",
         )
         self.assertIn("0x41", out)
+
+    def test_list_registers_tool(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            out = _fn(server.emu_list_registers)(sid)
+            self.assertIn("RAX", out)
+            self.assertIn("offset=", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_memory_unmap_and_protect_tools(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            _fn(server.emu_memory_map)(sid, "0xA000000", 0x1000, 7)
+            self.assertIn("Unmapped", _fn(server.emu_memory_unmap)(sid, "0xA000000", 0x1000))
+            self.assertIn("perms=", _fn(server.emu_memory_protect)(sid, "0x1000000", 0x1000, 5))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_breakpoint_tools(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            _fn(server.emu_memory_write)(sid, "0x1000000", "9090909090f4")
+            self.assertIn("Breakpoint set", _fn(server.emu_breakpoint_add)(sid, "0x1000003"))
+            out = _fn(server.emu_run)(sid, "0x1000000", "")
+            self.assertIn("breakpoint", out.lower())
+            self.assertIn("removed", _fn(server.emu_breakpoint_remove)(sid, "0x1000003"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_engine_options_jit(self):
+        sid = _new_session(engine="icicle", arch="x86_64", engine_options={"jit": True})
+        try:
+            _fn(server.emu_memory_write)(sid, "0x1000000", "48c7c0410000009090")
+            _fn(server.emu_run)(sid, "0x1000000", "0x1000009")
+            self.assertIn("(65)", _fn(server.emu_registers_read)(sid, ["rax"]))
+        finally:
+            _fn(server.emu_close_session)(sid)
 
 
 @unittest.skipUnless(HAS_ICICLE, "icicle not installed")

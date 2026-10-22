@@ -146,10 +146,35 @@ class IcicleEngine(BaseEngine):
 
     CAPABILITIES = frozenset({
         "shellcode", "address_hooks", "instruction_trace", "snapshots",
+        "memory_management", "breakpoints", "register_introspection",
     })
     SUPPORTED_ARCHS = tuple(ARCH_MAP)
 
-    def __init__(self, arch: str, **kwargs: Any):
+    # Icicle VM constructor knobs exposed through the wrapper (see the icicle
+    # binding).  jit defaults to False: the JIT misses a breakpoint added to a
+    # block that a prior step already translated, which would break breakpoints
+    # and address hooks.  Callers that do not mix stepping with breakpoints can
+    # pass jit=True for speed.
+    _VM_OPTIONS = (
+        "jit", "jit_mem", "shadow_stack", "recompilation",
+        "track_uninitialized", "optimize_instructions", "optimize_block", "tracing",
+    )
+
+    def __init__(
+        self,
+        arch: str,
+        *,
+        jit: bool = False,
+        jit_mem: bool = True,
+        shadow_stack: bool = False,
+        recompilation: bool = True,
+        track_uninitialized: bool = False,
+        optimize_instructions: bool = True,
+        optimize_block: bool = False,
+        tracing: bool = False,
+        mem_capacity: int | None = None,
+        **kwargs: Any,
+    ):
         if arch not in ARCH_MAP:
             raise ValueError(
                 f"Unsupported architecture '{arch}'. Supported: {list(ARCH_MAP.keys())}"
@@ -157,14 +182,29 @@ class IcicleEngine(BaseEngine):
         super().__init__(arch, **kwargs)
         self.engine_type = "icicle"
 
+        vm_opts = dict(
+            jit=jit, jit_mem=jit_mem, shadow_stack=shadow_stack,
+            recompilation=recompilation, track_uninitialized=track_uninitialized,
+            optimize_instructions=optimize_instructions, optimize_block=optimize_block,
+            tracing=tracing,
+        )
+        self.vm_options = vm_opts
+
         icicle_arch = ARCH_MAP[arch]
         try:
-            # jit=False avoids a breakpoint-after-step miss in the JIT path.
-            self.vm = Icicle(icicle_arch, jit=False)
+            self.vm = Icicle(icicle_arch, **vm_opts)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize Icicle for arch '{arch}' ({icicle_arch}): {e}"
             ) from e
+        if mem_capacity is not None:
+            try:
+                self.vm.mem_capacity = mem_capacity
+            except Exception as e:
+                raise RuntimeError(f"Failed to set mem_capacity={mem_capacity}: {e}") from e
+
+        # Execution breakpoints (distinct from observe-only address hooks).
+        self._breakpoints: set[int] = set()
 
         cs_spec = _CS_MAP.get(arch)
         self.cs: Cs | None = Cs(*cs_spec) if cs_spec else None
@@ -231,20 +271,20 @@ class IcicleEngine(BaseEngine):
 
     # -- Execution --
 
-    def start(self, begin: int, end: int, timeout_ms: int = 10000) -> dict[str, Any]:
+    def start(self, begin: int, end: int = 0, timeout_ms: int = 10000) -> dict[str, Any]:
         self._touch()
         self.stack_overflow_detected = False
         self.vm.pc = begin
+        # end == 0 means "free run" (until halt, breakpoint, crash or budget).
+        target = end if end else None
 
         use_step_loop = self.tracing_enabled or bool(self._addr_hooks)
         start_time = time.time()
-        error_msg = ""
-        status_name = "ok"
 
         if use_step_loop:
-            status_name, error_msg = self._run_stepwise(end, timeout_ms)
+            status_name, error_msg = self._run_stepwise(target, timeout_ms)
         else:
-            status_name, error_msg = self._run_native(end)
+            status_name, error_msg = self._run_native(target)
 
         elapsed = time.time() - start_time
         result: dict[str, Any] = {
@@ -258,35 +298,66 @@ class IcicleEngine(BaseEngine):
             result["error"] = error_msg
         return result
 
-    def _run_native(self, end: int) -> tuple[str, str]:
+    def _vm_step_one(self) -> RunStatus:
+        """Step exactly one instruction, stepping off a breakpoint if the PC
+        carries one (step(1) otherwise refuses to advance off a breakpoint)."""
+        pc = self.vm.pc
+        has_bp = pc in self._breakpoints
+        if has_bp:
+            self.vm.remove_breakpoint(pc)
+        st = self.vm.step(1)
+        if has_bp:
+            self.vm.add_breakpoint(pc)
+        return st
+
+    def _run_native(self, target: int | None) -> tuple[str, str]:
         """Fast path used when there is nothing to observe per-instruction."""
+        # If we are resuming directly off a breakpoint, advance one instruction
+        # first so run_until/run does not immediately re-break at the same PC.
+        if self.vm.pc in self._breakpoints:
+            st0 = self._vm_step_one()
+            if st0 != RunStatus.InstructionLimit:
+                return self._status_from_runstatus(st0)
+            if target is not None and self.vm.pc == target:
+                return "ok", ""
         self.vm.icount_limit = self.vm.icount + MAX_RUN_INSNS
-        st = self.vm.run_until(end)
+        st = self.vm.run_until(target) if target is not None else self.vm.run()
         if st == RunStatus.Breakpoint:
-            # The only breakpoint in play is run_until's own at `end`.
+            pc = self.vm.pc
+            if target is not None and pc == target:
+                return "ok", ""
+            if pc in self._breakpoints:
+                return "breakpoint", f"Stopped at breakpoint 0x{pc:x}"
             return "ok", ""
         if st == RunStatus.InstructionLimit:
-            return "timeout", f"Instruction budget ({MAX_RUN_INSNS}) exhausted before reaching 0x{end:x}"
+            where = f" before reaching 0x{target:x}" if target is not None else ""
+            return "timeout", f"Instruction budget ({MAX_RUN_INSNS}) exhausted{where}"
         return self._status_from_runstatus(st)
 
-    def _run_stepwise(self, end: int, timeout_ms: int) -> tuple[str, str]:
+    def _run_stepwise(self, target: int | None, timeout_ms: int) -> tuple[str, str]:
         """Single-step loop used when tracing is on or address hooks are set.
 
-        Hooks are detected by comparing the program counter, so no breakpoints
-        are installed (a breakpoint would stall ``step(1)``, which refuses to
-        advance off an address that carries one).
+        Hooks are detected by comparing the program counter.  Execution
+        breakpoints are also honoured here (step(1) refuses to advance off an
+        address carrying a native breakpoint, so we compare the PC instead).
         """
         deadline = time.time() + max(timeout_ms, 1) / 1000.0
+        first = True
         while True:
             pc = self.vm.pc
-            if pc == end:
+            if target is not None and pc == target:
                 return "ok", ""
+            # Honour a breakpoint unless we are resuming directly off it.
+            if not first and pc in self._breakpoints:
+                return "breakpoint", f"Stopped at breakpoint 0x{pc:x}"
             if time.time() > deadline:
-                return "timeout", f"Wall-clock timeout ({timeout_ms} ms) before reaching 0x{end:x}"
+                where = f" before reaching 0x{target:x}" if target is not None else ""
+                return "timeout", f"Wall-clock timeout ({timeout_ms} ms){where}"
             if self.tracing_enabled:
                 self._trace_instruction(pc)
             self._dispatch_hook(pc)
-            st = self.vm.step(1)
+            st = self._vm_step_one()
+            first = False
             if st == RunStatus.InstructionLimit:
                 # step(1) completed one instruction normally.
                 continue
@@ -295,6 +366,8 @@ class IcicleEngine(BaseEngine):
     def _status_from_runstatus(self, st: RunStatus) -> tuple[str, str]:
         if st == RunStatus.Halt:
             return "ok", ""
+        if st == RunStatus.Breakpoint:
+            return "breakpoint", f"Stopped at breakpoint 0x{self.vm.pc:x}"
         if st == RunStatus.UnhandledException:
             return self._exception_status()
         if st == RunStatus.OutOfMemory:
@@ -319,7 +392,7 @@ class IcicleEngine(BaseEngine):
             pc = self.vm.pc
             self._trace_instruction(pc)
             self._dispatch_hook(pc)
-            st = self.vm.step(1)
+            st = self._vm_step_one()
             if st != RunStatus.InstructionLimit:
                 # Anything other than a clean one-instruction completion (a
                 # crash, a halt, or self-modifying code) ends the stepping run.
@@ -352,6 +425,23 @@ class IcicleEngine(BaseEngine):
         except MemoryException as e:
             raise RuntimeError(f"Memory map failed at 0x{address:x} (size=0x{size:x}): {e}") from e
         self._regions[address] = (size, perms)
+
+    def memory_unmap(self, address: int, size: int) -> None:
+        try:
+            self.vm.mem_unmap(address, size)
+        except MemoryException as e:
+            raise RuntimeError(f"Memory unmap failed at 0x{address:x} (size=0x{size:x}): {e}") from e
+        # Drop any tracked region whose base falls in the unmapped range.
+        for base in [b for b in self._regions if address <= b < address + size]:
+            del self._regions[base]
+
+    def memory_protect(self, address: int, size: int, perms: int) -> None:
+        try:
+            self.vm.mem_protect(address, size, _to_protection(perms))
+        except MemoryException as e:
+            raise RuntimeError(f"Memory protect failed at 0x{address:x} (size=0x{size:x}): {e}") from e
+        if address in self._regions:
+            self._regions[address] = (self._regions[address][0], perms)
 
     def memory_search(self, pattern: bytes) -> list[int]:
         results: list[int] = []
@@ -391,6 +481,26 @@ class IcicleEngine(BaseEngine):
             except KeyError:
                 pass
         return result
+
+    def list_registers(self) -> dict[str, dict[str, int]]:
+        """Every register the SLEIGH spec defines, with byte offset and size."""
+        return {
+            name: {"offset": offset, "size": size}
+            for name, (offset, size) in self.vm.reg_list().items()
+        }
+
+    # -- Breakpoints --
+
+    def breakpoint_add(self, address: int) -> None:
+        self._touch()
+        self.vm.add_breakpoint(address)
+        self._breakpoints.add(address)
+
+    def breakpoint_remove(self, address: int) -> bool:
+        self._touch()
+        removed = self.vm.remove_breakpoint(address)
+        self._breakpoints.discard(address)
+        return bool(removed)
 
     # -- Hooks --
 
@@ -486,5 +596,6 @@ class IcicleEngine(BaseEngine):
         self.snapshots.clear()
         self.trace.clear()
         self._regions.clear()
+        self._breakpoints.clear()
         # The Rust VM is freed when self.vm is garbage-collected.
         self.vm = None

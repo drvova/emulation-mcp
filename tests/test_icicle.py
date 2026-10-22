@@ -233,6 +233,86 @@ class TestIcicleEngine(unittest.TestCase):
         for arch in ARCH_MAP:
             self.assertIn(arch, COMMON_REGS, f"No COMMON_REGS for {arch}")
 
+    # -- Extended binding coverage --
+
+    def test_capabilities(self):
+        eng = IcicleEngine(arch="x86_64")
+        caps = eng.CAPABILITIES
+        for c in ("memory_management", "breakpoints", "register_introspection"):
+            self.assertIn(c, caps)
+        eng.close()
+
+    def test_memory_unmap(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.memory_map(0xA000000, 0x1000, perms=7)
+        eng.memory_write(0xA000000, b"\x41")
+        eng.memory_unmap(0xA000000, 0x1000)
+        with self.assertRaises(RuntimeError):
+            eng.memory_read(0xA000000, 1)
+        eng.close()
+
+    def test_memory_protect(self):
+        # mem_protect governs guest execution; a guest write to a read-only page
+        # raises a write violation. (Host memory_write bypasses perms by design.)
+        eng = IcicleEngine(arch="x86_64")
+        eng.memory_protect(CODE_BASE, 0x1000, 5)  # r-x
+        # mov [rax], al  with rax -> the protected page => write violation
+        eng.register_write("rax", CODE_BASE)
+        eng.memory_write(CODE_BASE + 0x200, b"\x88\x00")  # mov [rax], al (host write ok)
+        result = eng.start(CODE_BASE + 0x200, CODE_BASE + 0x202)
+        self.assertEqual(result["status"], "error", result)
+        eng.close()
+
+    def test_list_registers(self):
+        eng = IcicleEngine(arch="x86_64")
+        regs = eng.list_registers()
+        self.assertGreater(len(regs), 100)
+        self.assertIn("RAX", regs)
+        self.assertEqual(regs["RAX"]["size"], 8)
+        self.assertIn("offset", regs["RAX"])
+        eng.close()
+
+    def test_breakpoint_halt_and_resume(self):
+        eng = IcicleEngine(arch="x86_64")
+        # nop;nop;nop;nop;nop;hlt
+        eng.memory_write(CODE_BASE, b"\x90\x90\x90\x90\x90\xf4")
+        eng.breakpoint_add(CODE_BASE + 3)
+        r1 = eng.start(CODE_BASE)  # free run -> should stop at the breakpoint
+        self.assertEqual(r1["status"], "breakpoint", r1)
+        self.assertEqual(eng.register_read("rip"), CODE_BASE + 3)
+        # Resume from the breakpoint; remove it so we run to the end.
+        eng.breakpoint_remove(CODE_BASE + 3)
+        r2 = eng.start(CODE_BASE + 3, CODE_BASE + 5)
+        self.assertEqual(r2["status"], "ok", r2)
+        eng.close()
+
+    def test_breakpoint_with_tracing(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.enable_tracing()
+        eng.memory_write(CODE_BASE, b"\x90\x90\x90\x90")
+        eng.breakpoint_add(CODE_BASE + 2)
+        r = eng.start(CODE_BASE, CODE_BASE + 4)
+        self.assertEqual(r["status"], "breakpoint", r)
+        self.assertEqual(eng.register_read("rip"), CODE_BASE + 2)
+        eng.close()
+
+    def test_free_run_to_halt(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.memory_write(CODE_BASE, b"\xff\xc0\xff\xc0\xf4")  # inc eax; inc eax; hlt
+        r = eng.start(CODE_BASE)  # no end -> free run
+        self.assertIn(r["status"], ("ok", "timeout", "error"))
+        self.assertEqual(eng.register_read("eax"), 2)
+        eng.close()
+
+    def test_constructor_options(self):
+        # jit=True is accepted; mem_capacity knob applies.
+        eng = IcicleEngine(arch="x86_64", jit=True, mem_capacity=60000)
+        self.assertEqual(eng.vm_options["jit"], True)
+        eng.memory_write(CODE_BASE, b"\x48\xc7\xc0\x41\x00\x00\x00\x90")
+        eng.start(CODE_BASE, CODE_BASE + 8)
+        self.assertEqual(eng.register_read("rax"), 0x41)
+        eng.close()
+
 
 if __name__ == "__main__":
     if not HAS_ICICLE:

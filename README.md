@@ -29,6 +29,15 @@ each can do.
   cross-check a Unicorn result when it looks suspicious
 - Same shellcode workflow as Unicorn: memory, registers, tracing, hooks, snapshots
 - Self-modifying code is detected and reported (not transparently re-translated)
+- **Wraps the full `icicle-emu` Python binding:** runtime memory management
+  (`emu_memory_unmap`, `emu_memory_protect`), execution breakpoints
+  (`emu_breakpoint_add`/`_remove`, halt-and-resume), free run (leave `end_addr`
+  empty), full register-file introspection (`emu_list_registers` — all ~839
+  x86-64 registers, offsets and sizes), and VM constructor knobs via
+  `engine_options` (`jit`, `shadow_stack`, `track_uninitialized`, `mem_capacity`, …).
+  Note: the `icicle-emu` PyPI binding is itself a subset of the Icicle framework —
+  the fuzzing/Linux/GDB crates are not exposed to Python and would need a custom
+  build from source.
 
 ### angr — symbolic execution *(new)*
 - Make a register or region of memory **symbolic**, then explore every path
@@ -56,6 +65,9 @@ each can do.
 | memory trace        |   ✓     |        |        |      |
 | snapshots           |   ✓     |   ✓    |   ✓    |  ✓   |
 | symbolic execution  |         |        |        |  ✓   |
+| memory management   |         |        |   ✓    |      |
+| breakpoints         |         |        |   ✓    |      |
+| register introspection |      |        |   ✓    |      |
 
 ## Requirements
 
@@ -106,6 +118,9 @@ Engine-specific tools:
 - `emu_list_engines` — discover installed engines and capabilities
 - `emu_hook_syscall`, `emu_hook_api` — Qiling only
 - `emu_set_symbolic_register`, `emu_set_symbolic_memory`, `emu_explore`, `emu_solve` — angr only
+- `emu_memory_unmap`, `emu_memory_protect` — runtime memory management (Icicle)
+- `emu_breakpoint_add`, `emu_breakpoint_remove` — execution breakpoints (Icicle)
+- `emu_list_registers` — full register-file introspection (Icicle)
 - `emu_compare_engines` — Unicorn vs. Icicle differential check
 
 ## Architecture

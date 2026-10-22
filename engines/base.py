@@ -73,6 +73,9 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "memory_trace": "Record memory reads and writes",
     "snapshots": "Save and restore emulation state",
     "symbolic": "Symbolic execution: symbolic inputs, path exploration, constraint solving",
+    "memory_management": "Unmap regions and change guest page permissions at runtime",
+    "breakpoints": "Set execution breakpoints that halt a run for inspection/resume",
+    "register_introspection": "Enumerate the full register file with offsets and sizes",
 }
 
 
@@ -142,6 +145,14 @@ class BaseEngine(ABC):
         """Search all mapped memory for pattern. Returns list of addresses."""
         ...
 
+    def memory_unmap(self, address: int, size: int) -> None:
+        """Unmap a memory region. Engines with the 'memory_management' capability."""
+        raise NotImplementedError(f"memory_unmap is not supported by the '{self.engine_type}' engine")
+
+    def memory_protect(self, address: int, size: int, perms: int) -> None:
+        """Change guest page permissions (rwx bitmask). 'memory_management' capability."""
+        raise NotImplementedError(f"memory_protect is not supported by the '{self.engine_type}' engine")
+
     # -- Registers --
 
     @abstractmethod
@@ -173,6 +184,18 @@ class BaseEngine(ABC):
     def hook_api(self, func_name: str, callback: Callable | None = None) -> str:
         """Hook a library API by name. Only engines with the 'api_hooks' capability."""
         raise NotImplementedError(f"API hooks are not supported by the '{self.engine_type}' engine")
+
+    def breakpoint_add(self, address: int) -> None:
+        """Set an execution breakpoint. Engines with the 'breakpoints' capability."""
+        raise NotImplementedError(f"Breakpoints are not supported by the '{self.engine_type}' engine")
+
+    def breakpoint_remove(self, address: int) -> bool:
+        """Remove an execution breakpoint. Returns True if one was removed."""
+        raise NotImplementedError(f"Breakpoints are not supported by the '{self.engine_type}' engine")
+
+    def list_registers(self) -> dict[str, dict[str, int]]:
+        """Enumerate all registers as {name: {offset, size}}. 'register_introspection'."""
+        raise NotImplementedError(f"Register introspection is not supported by the '{self.engine_type}' engine")
 
     def hook_remove(self, hook_id: str) -> bool:
         """Remove a hook by ID. Returns True if removed."""

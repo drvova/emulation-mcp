@@ -497,6 +497,7 @@ def emu_create_session(
     ostype: str = "linux",
     args: list[str] | None = None,
     enable_trace: bool = False,
+    engine_options: dict | None = None,
 ) -> str:
     """Create a new emulation session.
 
@@ -517,6 +518,11 @@ def emu_create_session(
     For angr binary mode:
       binary_path: Path to the ELF/PE binary (no rootfs needed).
 
+    engine_options: Optional dict of engine-specific constructor options. For
+      Icicle these map onto the VM knobs, e.g. {"jit": true} (faster, but only
+      safe without breakpoints/stepping), {"shadow_stack": true},
+      {"track_uninitialized": true}, or {"mem_capacity": 100000}.
+
     Returns session_id to use with other emu_* tools.
     """
     try:
@@ -530,6 +536,7 @@ def emu_create_session(
             return (f"Error: Engine '{engine}' is not installed. "
                     f"See emu_list_engines for installation instructions.")
         engine_cls = get_engine_class(engine)
+        opts = engine_options or {}
 
         if engine == "qiling":
             if not binary_path:
@@ -543,13 +550,13 @@ def emu_create_session(
             )
         elif engine == "angr" and binary_path:
             _validate_binary_path(binary_path)  # EM-1
-            eng = engine_cls(arch=arch, binary_path=binary_path)
+            eng = engine_cls(arch=arch, binary_path=binary_path, **opts)
             if enable_trace:
                 eng.enable_tracing()
         else:
             if not arch:
                 return f"Error: arch is required for the '{engine}' engine."
-            eng = engine_cls(arch=arch)
+            eng = engine_cls(arch=arch, **opts)
             if enable_trace:
                 eng.enable_tracing()
 
@@ -615,6 +622,9 @@ def emu_run(
     format: Output format - "default" for plain text, "report" for markdown tables.
 
     For Qiling sessions without start/end: runs from the binary's entry point.
+    For Icicle with start_addr but no end_addr: runs freely until a halt,
+    breakpoint, crash, or the instruction budget (status "breakpoint" stops at a
+    breakpoint; resume by running again from the current pc).
     Returns execution summary with register state.
     """
     if format not in ("default", "report"):
@@ -1201,6 +1211,56 @@ def emu_memory_map(session_id: str, address: str, size: int, perms: int = 7) -> 
 
 
 @mcp.tool()
+def emu_memory_unmap(session_id: str, address: str, size: int) -> str:
+    """Unmap a memory region (Icicle sessions; 'memory_management' capability).
+
+    session_id: Active session ID.
+    address: Start address (hex, page-aligned).
+    size: Size in bytes to unmap.
+    """
+    try:
+        engine = sessions.get(session_id)
+        addr = _parse_addr(address)
+        if size <= 0:
+            return "Error: size must be positive."
+        engine.memory_unmap(addr, size)
+        return f"Unmapped 0x{size:x} bytes at 0x{addr:x}."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Memory unmap error: {e}"
+
+
+@mcp.tool()
+def emu_memory_protect(session_id: str, address: str, size: int, perms: int) -> str:
+    """Change guest page permissions for a region ('memory_management' capability).
+
+    Affects accesses made by the *emulated* code (e.g. to trigger a write or
+    exec violation); the memory read/write tools bypass these permissions.
+
+    session_id: Active session ID.
+    address: Start address (hex, page-aligned).
+    size: Size in bytes.
+    perms: Permission bitmask (7=rwx, 5=rx, 4=r, 6=rw, 1=x).
+    """
+    try:
+        engine = sessions.get(session_id)
+        addr = _parse_addr(address)
+        if size <= 0:
+            return "Error: size must be positive."
+        engine.memory_protect(addr, size, perms)
+        return f"Set perms={perms} on 0x{size:x} bytes at 0x{addr:x}."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Memory protect error: {e}"
+
+
+@mcp.tool()
 def emu_memory_search(session_id: str, pattern_hex: str) -> str:
     """Search all mapped memory for a byte pattern.
 
@@ -1406,6 +1466,81 @@ def emu_remove_hook(session_id: str, hook_id: str) -> str:
         return str(e)
     except Exception as e:
         return f"Remove hook error: {e}"
+
+
+# ===========================================================================
+# Breakpoints & register introspection
+# ===========================================================================
+
+@mcp.tool()
+def emu_breakpoint_add(session_id: str, address: str) -> str:
+    """Set an execution breakpoint that halts a run for inspection ('breakpoints').
+
+    Unlike an address hook (which observes and continues), a breakpoint stops
+    the run; emu_run reports status "breakpoint". Resume by calling emu_run
+    again with start_addr set to the current pc, or emu_step.
+
+    session_id: Active session ID.
+    address: Hex address to break on.
+    """
+    try:
+        engine = sessions.get(session_id)
+        addr = _parse_addr(address)
+        engine.breakpoint_add(addr)
+        return f"Breakpoint set at 0x{addr:x}."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Breakpoint error: {e}"
+
+
+@mcp.tool()
+def emu_breakpoint_remove(session_id: str, address: str) -> str:
+    """Remove an execution breakpoint ('breakpoints' capability).
+
+    session_id: Active session ID.
+    address: Hex address of the breakpoint to remove.
+    """
+    try:
+        engine = sessions.get(session_id)
+        addr = _parse_addr(address)
+        if engine.breakpoint_remove(addr):
+            return f"Breakpoint at 0x{addr:x} removed."
+        return f"No breakpoint at 0x{addr:x}."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Breakpoint error: {e}"
+
+
+@mcp.tool()
+def emu_list_registers(session_id: str) -> str:
+    """List every register the engine exposes, with byte offset and size.
+
+    Engines with the 'register_introspection' capability (Icicle) enumerate the
+    full SLEIGH register file (hundreds of entries, including vector/flag/system
+    registers). Read any of them by name with emu_registers_read.
+
+    session_id: Active session ID.
+    """
+    try:
+        engine = sessions.get(session_id)
+        regs = engine.list_registers()
+        lines = [f"Registers ({len(regs)}):"]
+        for name in sorted(regs, key=lambda n: regs[n].get("offset", 0)):
+            meta = regs[name]
+            lines.append(f"  {name:<12} offset={meta.get('offset', '?')} size={meta.get('size', '?')}")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"List registers error: {e}"
 
 
 # ===========================================================================
