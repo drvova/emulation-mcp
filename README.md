@@ -17,9 +17,19 @@ each can do.
 
 ### Qiling Framework — full binary emulation
 - Load and run full ELF/PE binaries with OS-level support (Linux, Windows, ...)
-- Syscall and API hooking — intercept and inspect OS interactions
-- Filesystem/registry/network emulation; rootfs overlays for shared libraries
-- Persistent sessions with state preservation between tool calls
+- Syscall and API hooking — intercept, inspect, or **observe** (`when="enter"/"exit"`)
+  OS interactions without replacing them
+- **Filesystem mapping** (`emu_fs_map`) — serve a host file/dir for a guest path
+  (configs, device nodes, a `/flag` the target reads); rootfs overlays for libraries
+- **Standard I/O** — feed the guest's stdin (`emu_set_stdin`) and capture its
+  stdout/stderr (`emu_capture_output`)
+- **Bottom-level instrumentation** — `engine.add_mem_hook` (read/write/unmapped),
+  `add_code_hook`, `add_block_hook`, `add_intr_hook` (via `emu_eval`) fire Python
+  callbacks on memory access, every instruction/block, or interrupts
+- **Native disassembly** (`emu_disassemble`), **full register introspection**
+  (`emu_list_registers`), **memory-map listing** (`emu_memory_maps`) and
+  C-string reads (`emu_read_string`)
+- Persistent sessions with state preservation; native snapshot/restore
 
 ### Icicle — SLEIGH-based CPU emulation *(new)*
 - CPU emulator built on Ghidra's SLEIGH instruction semantics
@@ -128,12 +138,15 @@ show which are active).
 | event inspection    |         |        |        |  ✓   |
 | memory management   |         |        |   ✓    |      |
 | breakpoints         |         |        |   ✓    |      |
-| register introspection |      |        |   ✓    |      |
+| register introspection |      |   ✓    |   ✓    |      |
+| native disassembly  |         |   ✓    |  ✓ †   |      |
+| callback hooks      |         |   ✓    |  ✓ †   |      |
+| memory hooks        |         |   ✓    |  ✓ †   |      |
+| filesystem mapping  |         |   ✓    |        |      |
+| stdin / stdout I/O  |         |   ✓    |        |      |
+| memory-map listing  |         |   ✓    |        |      |
 | reverse execution   |         |        |  ✓ †   |      |
-| native disassembly  |         |        |  ✓ †   |      |
 | call stack          |         |        |  ✓ †   |      |
-| callback hooks      |         |        |  ✓ †   |      |
-| memory hooks        |         |        |  ✓ †   |      |
 | wide registers      |         |        |  ✓ †   |      |
 | Linux OS emulation  |         |   ✓    |  ✓ †   |      |
 | block coverage      |         |        |  ✓ †   |      |
@@ -188,7 +201,9 @@ Session/exec/memory/register/hook/snapshot/trace tools are shared across engines
 Engine-specific tools:
 
 - `emu_list_engines` — discover installed engines and capabilities
-- `emu_hook_syscall`, `emu_hook_api` — Qiling only
+- `emu_hook_syscall`, `emu_hook_api` — Qiling only (with `when="call"/"enter"/"exit"`)
+- `emu_fs_map`, `emu_set_stdin`, `emu_capture_output` — filesystem mapping and stdin/stdout I/O (Qiling)
+- `emu_memory_maps`, `emu_read_string` — list mapped regions / read a C string (Qiling)
 - `emu_set_symbolic_register`, `emu_set_symbolic_memory`, `emu_explore`, `emu_solve` — angr only
 - `emu_constrain`, `emu_value_range` — add solver constraints / query a variable's range (angr)
 - `emu_cfg`, `emu_call_function` — CFG/function listing and function execution (angr)
@@ -197,9 +212,9 @@ Engine-specific tools:
 - `emu_register_read_wide`, `emu_register_write_wide` — >64-bit registers (extended Icicle)
 - `emu_memory_unmap`, `emu_memory_protect` — runtime memory management (Icicle)
 - `emu_breakpoint_add`, `emu_breakpoint_remove` — execution breakpoints (Icicle)
-- `emu_list_registers` — full register-file introspection (Icicle)
+- `emu_list_registers` — full register-file introspection (Icicle, Qiling)
 - `emu_step_back`, `emu_goto_icount` — reverse execution / time-travel (extended Icicle)
-- `emu_disassemble`, `emu_callstack` — native disassembly and call stack (extended Icicle)
+- `emu_disassemble` — native disassembly (extended Icicle, Qiling); `emu_callstack` — call stack (extended Icicle)
 - `emu_coverage` — basic-block coverage enable/get/clear (extended Icicle)
 - `emu_gdb_serve` / `emu_gdb_stop` — serve a GDB remote stub (non-blocking by
   default) to attach a real debugger (extended Icicle)

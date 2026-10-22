@@ -89,6 +89,8 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "sim_procedures": "Replace or skip functions with Python stubs (SimProcedures)",
     "callback_hooks": "Register Python callbacks that fire during emulation",
     "memory_hooks": "Register Python callbacks on guest memory reads/writes (watchpoints)",
+    "filesystem": "Map host files/directories into the emulated filesystem",
+    "io": "Feed the guest's stdin and capture its stdout/stderr",
     "wide_registers": "Read/write registers wider than 64 bits (vector/flag aggregates)",
 }
 
@@ -306,6 +308,42 @@ class BaseEngine(ABC):
         starting address; None widens to (nearly) the whole space.
         """
         raise NotImplementedError(f"Memory-access hooks are not supported by the '{self.engine_type}' engine")
+
+    def add_code_hook(self, callback: Callable, start: int | None = None, end: int | None = None) -> str:
+        """Fire a callback on every instruction (optionally in a range). 'callback_hooks'."""
+        raise NotImplementedError(f"Code hooks are not supported by the '{self.engine_type}' engine")
+
+    def add_block_hook(self, callback: Callable, start: int | None = None, end: int | None = None) -> str:
+        """Fire a callback on every basic block (optionally in a range). 'callback_hooks'."""
+        raise NotImplementedError(f"Block hooks are not supported by the '{self.engine_type}' engine")
+
+    def add_intr_hook(self, callback: Callable) -> str:
+        """Fire a callback on every interrupt/exception. 'callback_hooks'."""
+        raise NotImplementedError(f"Interrupt hooks are not supported by the '{self.engine_type}' engine")
+
+    def memory_maps(self) -> list[dict[str, Any]]:
+        """List the guest's mapped memory regions (start/end/perms/label)."""
+        raise NotImplementedError(f"Memory-map listing is not supported by the '{self.engine_type}' engine")
+
+    def read_string(self, address: int, max_len: int = 1024) -> str:
+        """Read a NUL-terminated string from guest memory."""
+        raise NotImplementedError(f"String reads are not supported by the '{self.engine_type}' engine")
+
+    def add_fs_mapper(self, guest_path: str, host_path: str) -> None:
+        """Map a host file/dir into the emulated filesystem. 'filesystem' capability."""
+        raise NotImplementedError(f"Filesystem mapping is not supported by the '{self.engine_type}' engine")
+
+    def set_stdin(self, data: bytes) -> None:
+        """Feed bytes to the guest's standard input. 'io' capability."""
+        raise NotImplementedError(f"stdin injection is not supported by the '{self.engine_type}' engine")
+
+    def capture_output(self) -> None:
+        """Start capturing the guest's stdout/stderr. 'io' capability."""
+        raise NotImplementedError(f"Output capture is not supported by the '{self.engine_type}' engine")
+
+    def get_output(self) -> dict[str, str]:
+        """Return the captured stdout/stderr so far. 'io' capability."""
+        raise NotImplementedError(f"Output capture is not supported by the '{self.engine_type}' engine")
 
     def register_read_bytes(self, name: str) -> bytes:
         """Read a register's full backing bytes (wide registers). 'wide_registers'."""

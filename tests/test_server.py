@@ -25,6 +25,15 @@ try:
 except ImportError:
     HAS_ANGR = False
 
+try:
+    import qiling  # noqa: F401
+    from tests.test_qiling import build_mini_rootfs
+    HAS_QILING = True
+    _QL_MINI = build_mini_rootfs()
+except Exception:
+    HAS_QILING = False
+    _QL_MINI = None
+
 
 def _fn(tool):
     """Return the underlying function of a FastMCP tool (or the callable itself)."""
@@ -596,6 +605,81 @@ class TestAngrThroughServer(unittest.TestCase):
         try:
             out = _fn(server.emu_list_sessions)()
             self.assertIn(sid, out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+
+@unittest.skipUnless(HAS_QILING and _QL_MINI is not None,
+                     "qiling or gcc (for the static-binary rootfs) not available")
+class TestQilingThroughServer(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rootfs, cls.bins = _QL_MINI
+
+    def _session(self, name) -> str:
+        return _new_session(engine="qiling", binary_path=self.bins[name],
+                            rootfs=self.rootfs, arch="x86_64", ostype="linux")
+
+    def test_disassemble_and_maps_and_registers(self):
+        sid = self._session("hello")
+        try:
+            entry = server.sessions.get(sid).ql.loader.entry_point
+            dis = _fn(server.emu_disassemble)(sid, hex(entry), 2)
+            self.assertIn("0x", dis)
+            self.assertIn("Memory maps", _fn(server.emu_memory_maps)(sid))
+            self.assertIn("rip", _fn(server.emu_list_registers)(sid))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_capture_output_via_server(self):
+        sid = self._session("hello")
+        try:
+            self.assertIn("capture started", _fn(server.emu_capture_output)(sid, "start"))
+            _fn(server.emu_run)(sid)
+            self.assertIn("hi from qiling", _fn(server.emu_capture_output)(sid, "get"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_fs_map_via_server(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        flag = os.path.join(d, "flag")
+        with open(flag, "w") as f:
+            f.write("FLAG{server-qiling}")
+        sid = self._session("catflag")
+        try:
+            self.assertIn("Mapped", _fn(server.emu_fs_map)(sid, "/flag.txt", flag))
+            _fn(server.emu_capture_output)(sid, "start")
+            _fn(server.emu_run)(sid)
+            self.assertIn("FLAG{server-qiling}", _fn(server.emu_capture_output)(sid, "get"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_set_stdin_via_server(self):
+        sid = self._session("echo")
+        try:
+            self.assertIn("preloaded", _fn(server.emu_set_stdin)(sid, "server-stdin\n"))
+            _fn(server.emu_capture_output)(sid, "start")
+            _fn(server.emu_run)(sid)
+            self.assertIn("server-stdin", _fn(server.emu_capture_output)(sid, "get"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_syscall_observe_via_server(self):
+        sid = self._session("hello")
+        try:
+            out = _fn(server.emu_hook_syscall)(sid, "write", when="enter")
+            self.assertIn("(enter)", out)
+            self.assertIn("Error", _fn(server.emu_hook_syscall)(sid, "write", when="bogus"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_io_tools_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_fs_map)(sid, "/x", "/etc/hostname"))
+            self.assertIn("not supported", _fn(server.emu_memory_maps)(sid))
+            self.assertIn("not supported", _fn(server.emu_capture_output)(sid, "start"))
         finally:
             _fn(server.emu_close_session)(sid)
 

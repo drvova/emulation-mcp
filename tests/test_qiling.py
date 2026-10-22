@@ -34,6 +34,53 @@ ROOTFS_PATH = os.environ.get("QILING_ROOTFS", "")
 HAS_ROOTFS = os.path.isdir(ROOTFS_PATH)
 
 
+# A self-contained rootfs of tiny *statically linked* Linux/x86-64 binaries.
+# Static linking means no shared libraries are needed, so Qiling can run them
+# with a minimal rootfs (just the binaries) and the extended-feature tests work
+# anywhere gcc is available — no external rootfs download required.
+_MINI_SOURCES = {
+    "hello": '#include <unistd.h>\n#include <string.h>\n'
+             'int main(void){const char*m="hi from qiling\\n";write(1,m,strlen(m));return 7;}\n',
+    "echo":  '#include <unistd.h>\n'
+             'int main(void){char b[64];int n=read(0,b,sizeof b);if(n>0)write(1,b,n);return 0;}\n',
+    "catflag": '#include <unistd.h>\n#include <fcntl.h>\n'
+               'int main(void){char b[64];int fd=open("/flag.txt",0);'
+               'if(fd<0){write(1,"noflag\\n",7);return 1;}'
+               'int n=read(fd,b,sizeof b);if(n>0)write(1,b,n);return 0;}\n',
+}
+_mini_rootfs_cache = {}  # None = build attempted and failed
+
+
+def build_mini_rootfs():
+    """Build the static-binary rootfs once; return (rootfs_dir, {name: path}) or None."""
+    import shutil, subprocess, tempfile
+    if "result" in _mini_rootfs_cache:
+        return _mini_rootfs_cache["result"]
+    result = None
+    if shutil.which("gcc") is not None:
+        d = tempfile.mkdtemp(prefix="ql_mini_rootfs_")
+        paths = {}
+        ok = True
+        for name, src in _MINI_SOURCES.items():
+            cpath = os.path.join(d, name + ".c")
+            opath = os.path.join(d, name)
+            with open(cpath, "w") as f:
+                f.write(src)
+            try:
+                subprocess.run(["gcc", "-static", "-O0", "-o", opath, cpath],
+                               check=True, capture_output=True, timeout=60)
+                paths[name] = opath
+            except Exception:
+                ok = False
+                break
+        result = (d, paths) if ok else None
+    _mini_rootfs_cache["result"] = result
+    return result
+
+
+HAS_MINI_ROOTFS = build_mini_rootfs() is not None
+
+
 @unittest.skipUnless(HAS_QILING, "qiling not installed")
 class TestArchMapping(unittest.TestCase):
     """Test architecture and OS string resolution."""
@@ -209,6 +256,137 @@ class TestQilingEngineIntegration(unittest.TestCase):
         info = engine.get_info()
         self.assertEqual(info["engine_type"], "qiling")
         engine.close()
+
+
+@unittest.skipUnless(HAS_QILING and HAS_MINI_ROOTFS,
+                     "qiling or gcc (for the static-binary rootfs) not available")
+class TestQilingExtended(unittest.TestCase):
+    """Extended-feature tests on a self-built static-binary rootfs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rootfs, cls.bins = build_mini_rootfs()
+
+    def _engine(self, name):
+        return QilingEngine(binary_path=self.bins[name], rootfs=self.rootfs,
+                            arch="x86_64", ostype="linux")
+
+    def test_capabilities_present(self):
+        eng = self._engine("hello")
+        for cap in ("memory_hooks", "callback_hooks", "disassembly",
+                    "register_introspection", "filesystem", "io"):
+            self.assertIn(cap, eng.CAPABILITIES)
+        eng.close()
+
+    def test_disassemble(self):
+        eng = self._engine("hello")
+        insns = eng.disassemble(eng.ql.loader.entry_point, 3)
+        self.assertEqual(len(insns), 3)
+        self.assertTrue(all("instruction" in i and i["address"].startswith("0x") for i in insns))
+        eng.close()
+
+    def test_list_registers(self):
+        eng = self._engine("hello")
+        regs = eng.list_registers()
+        self.assertGreater(len(regs), 50)
+        self.assertIn("rip", regs)
+        self.assertIn("value", regs["rip"])
+        eng.close()
+
+    def test_memory_maps(self):
+        eng = self._engine("hello")
+        maps = eng.memory_maps()
+        self.assertGreater(len(maps), 0)
+        self.assertTrue(all({"start", "end", "perms"} <= set(m) for m in maps))
+        eng.close()
+
+    def test_code_and_mem_hooks_fire(self):
+        eng = self._engine("hello")
+        hits = [0]
+        writes = []
+        eng.add_code_hook(lambda ql, a, s: hits.__setitem__(0, hits[0] + 1))
+        eng.add_mem_hook(lambda ql, acc, a, s, v: writes.append(a), kind="write")
+        eng.start()
+        self.assertGreater(hits[0], 0)
+        self.assertGreater(len(writes), 0)
+        eng.close()
+
+    def test_hook_remove(self):
+        eng = self._engine("hello")
+        hid = eng.add_code_hook(lambda ql, a, s: None)
+        self.assertEqual(len(eng.list_hooks()), 1)
+        self.assertTrue(eng.hook_remove(hid))
+        self.assertEqual(eng.list_hooks(), [])
+        eng.close()
+
+    def test_bad_mem_hook_kind(self):
+        eng = self._engine("hello")
+        with self.assertRaises(ValueError):
+            eng.add_mem_hook(lambda *a: None, kind="exec")
+        eng.close()
+
+    def test_capture_stdout(self):
+        eng = self._engine("hello")
+        eng.capture_output()
+        eng.start()
+        self.assertEqual(eng.get_output()["stdout"], "hi from qiling\n")
+        eng.close()
+
+    def test_get_output_before_capture_errors(self):
+        eng = self._engine("hello")
+        with self.assertRaises(RuntimeError):
+            eng.get_output()
+        eng.close()
+
+    def test_set_stdin_echo(self):
+        eng = self._engine("echo")
+        eng.set_stdin(b"piped-input\n")
+        eng.capture_output()
+        eng.start()
+        self.assertEqual(eng.get_output()["stdout"], "piped-input\n")
+        eng.close()
+
+    def test_fs_mapper(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        flag = os.path.join(d, "flag")
+        with open(flag, "w") as f:
+            f.write("FLAG{qiling-fs}")
+        eng = self._engine("catflag")
+        eng.add_fs_mapper("/flag.txt", flag)
+        eng.capture_output()
+        eng.start()
+        self.assertEqual(eng.get_output()["stdout"], "FLAG{qiling-fs}")
+        eng.close()
+
+    def test_fs_mapper_missing_host(self):
+        eng = self._engine("hello")
+        with self.assertRaises(FileNotFoundError):
+            eng.add_fs_mapper("/x", "/no/such/host/path/xyz")
+        eng.close()
+
+    def test_syscall_observe_keeps_behaviour(self):
+        eng = self._engine("hello")
+        seen = []
+        eng.hook_syscall("write", lambda ql, *a, **k: seen.append(1), when="enter")
+        eng.capture_output()
+        eng.start()
+        self.assertGreater(len(seen), 0)               # observer fired
+        self.assertEqual(eng.get_output()["stdout"], "hi from qiling\n")  # behaviour intact
+        eng.close()
+
+    def test_bad_when_rejected(self):
+        eng = self._engine("hello")
+        with self.assertRaises(ValueError):
+            eng.hook_syscall("write", when="whenever")
+        eng.close()
+
+    def test_read_string(self):
+        eng = self._engine("hello")
+        addr = eng.ql.loader.entry_point
+        eng.memory_write(addr, b"hello world\x00trailing")
+        self.assertEqual(eng.read_string(addr), "hello world")
+        eng.close()
 
 
 if __name__ == "__main__":

@@ -1527,12 +1527,15 @@ def emu_hook_address(session_id: str, address: str, description: str = "") -> st
 
 
 @mcp.tool()
-def emu_hook_syscall(session_id: str, syscall_name: str, description: str = "") -> str:
+def emu_hook_syscall(session_id: str, syscall_name: str, description: str = "",
+                     when: str = "call") -> str:
     """Hook a syscall by name. Qiling sessions only.
 
     session_id: Active session ID.
     syscall_name: Name of the syscall (e.g. "write", "open", "execve", "system").
     description: Optional description.
+    when: "call" replaces the syscall; "enter"/"exit" observe it around the real
+      handler (behaviour stays intact). Default "call".
 
     The hooked syscall will be logged in the trace with arguments.
     """
@@ -1540,10 +1543,12 @@ def emu_hook_syscall(session_id: str, syscall_name: str, description: str = "") 
         engine = sessions.get(session_id)
         if not engine.has_capability("syscall_hooks"):
             return f"Error: Syscall hooks are not supported by the '{engine.engine_type}' engine (Qiling only)."
-        hook_id = engine.hook_syscall(syscall_name)
+        hook_id = engine.hook_syscall(syscall_name, when=when)
         if description:
             engine.hooks[hook_id].description = description
-        return f"Syscall hook installed: {hook_id} for '{syscall_name}'"
+        return f"Syscall hook installed: {hook_id} for '{syscall_name}' ({when})"
+    except ValueError as e:
+        return f"Error: {e}"
     except KeyError as e:
         return str(e)
     except Exception as e:
@@ -1551,12 +1556,15 @@ def emu_hook_syscall(session_id: str, syscall_name: str, description: str = "") 
 
 
 @mcp.tool()
-def emu_hook_api(session_id: str, api_name: str, description: str = "") -> str:
+def emu_hook_api(session_id: str, api_name: str, description: str = "",
+                 when: str = "call") -> str:
     """Hook a library API call by name. Qiling sessions only.
 
     session_id: Active session ID.
     api_name: Function name (e.g. "system", "printf", "strcpy", "popen").
     description: Optional description.
+    when: "call" replaces the function; "enter"/"exit" observe it around the real
+      implementation. Default "call".
 
     The hooked API call will be logged in the trace with arguments.
     """
@@ -1564,10 +1572,12 @@ def emu_hook_api(session_id: str, api_name: str, description: str = "") -> str:
         engine = sessions.get(session_id)
         if not engine.has_capability("api_hooks"):
             return f"Error: API hooks are not supported by the '{engine.engine_type}' engine (Qiling only)."
-        hook_id = engine.hook_api(api_name)
+        hook_id = engine.hook_api(api_name, when=when)
         if description:
             engine.hooks[hook_id].description = description
-        return f"API hook installed: {hook_id} for '{api_name}'"
+        return f"API hook installed: {hook_id} for '{api_name}' ({when})"
+    except ValueError as e:
+        return f"Error: {e}"
     except KeyError as e:
         return str(e)
     except Exception as e:
@@ -1672,11 +1682,12 @@ def emu_breakpoint_remove(session_id: str, address: str) -> str:
 
 @mcp.tool()
 def emu_list_registers(session_id: str) -> str:
-    """List every register the engine exposes, with byte offset and size.
+    """List every register the engine exposes ('register_introspection').
 
-    Engines with the 'register_introspection' capability (Icicle) enumerate the
-    full SLEIGH register file (hundreds of entries, including vector/flag/system
-    registers). Read any of them by name with emu_registers_read.
+    Icicle enumerates the full SLEIGH register file with byte offset and size
+    (hundreds of entries, including vector/flag/system registers); Qiling
+    enumerates its architecture register map with each register's current value.
+    Read any of them by name with emu_registers_read.
 
     session_id: Active session ID.
     """
@@ -1686,7 +1697,14 @@ def emu_list_registers(session_id: str) -> str:
         lines = [f"Registers ({len(regs)}):"]
         for name in sorted(regs, key=lambda n: regs[n].get("offset", 0)):
             meta = regs[name]
-            lines.append(f"  {name:<12} offset={meta.get('offset', '?')} size={meta.get('size', '?')}")
+            parts = []
+            if "value" in meta:
+                parts.append(f"value=0x{meta['value']:x}")
+            if "offset" in meta:
+                parts.append(f"offset={meta['offset']}")
+            if "size" in meta:
+                parts.append(f"size={meta['size']}")
+            lines.append(f"  {name:<12} {' '.join(parts)}")
         return "\n".join(lines)
     except NotImplementedError as e:
         return f"Error: {e}"
@@ -1848,6 +1866,131 @@ def emu_disassemble(session_id: str, address: str, count: int = 10) -> str:
         return str(e)
     except Exception as e:
         return f"Disassemble error: {e}"
+
+
+@mcp.tool()
+def emu_memory_maps(session_id: str) -> str:
+    """List the guest's mapped memory regions (Qiling).
+
+    Shows each region's range, permissions and label/path — useful to see where
+    the binary, stack, heap and shared objects landed.
+
+    session_id: Active session ID.
+    """
+    try:
+        engine = sessions.get(session_id)
+        maps = engine.memory_maps()
+        if not maps:
+            return "No mapped regions."
+        lines = [f"Memory maps ({len(maps)}):"]
+        for m in maps:
+            label = m["label"] + (f" {m['path']}" if m.get("path") else "")
+            lines.append(f"  0x{m['start']:x}-0x{m['end']:x} {m['perms']:<4} {label}")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Memory maps error: {e}"
+
+
+@mcp.tool()
+def emu_read_string(session_id: str, address: str, max_len: int = 1024) -> str:
+    """Read a NUL-terminated string from guest memory (Qiling).
+
+    session_id: Active session ID.
+    address: Hex address of the string.
+    max_len: Maximum bytes to scan for the terminator (default 1024).
+    """
+    try:
+        engine = sessions.get(session_id)
+        s = engine.read_string(_parse_addr(address), max_len)
+        return f"0x{_parse_addr(address):x}: {s!r}"
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Read string error: {e}"
+
+
+@mcp.tool()
+def emu_fs_map(session_id: str, guest_path: str, host_path: str) -> str:
+    """Map a host file/directory into the emulated filesystem ('filesystem', Qiling).
+
+    When the guest opens `guest_path`, it sees the contents of `host_path`. Use it
+    to supply inputs, config, device nodes, or a flag file the target reads.
+
+    session_id: Active session ID.
+    guest_path: Path inside the emulated FS (e.g. "/flag.txt", "/etc/passwd").
+    host_path: Real path on this machine to serve for it.
+    """
+    try:
+        engine = sessions.get(session_id)
+        engine.add_fs_mapper(guest_path, host_path)
+        return f"Mapped guest '{guest_path}' -> host '{host_path}'."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Filesystem map error: {e}"
+
+
+@mcp.tool()
+def emu_set_stdin(session_id: str, data: str, is_hex: bool = False) -> str:
+    """Preload the guest's standard input ('io' capability, Qiling).
+
+    session_id: Active session ID.
+    data: Input to feed. UTF-8 text by default; set is_hex=true to pass raw bytes
+      as a hex string.
+    """
+    try:
+        engine = sessions.get(session_id)
+        payload = bytes.fromhex(data) if is_hex else data.encode("utf-8")
+        engine.set_stdin(payload)
+        return f"stdin preloaded with {len(payload)} bytes."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except ValueError as e:
+        return f"Error: invalid hex input: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"set stdin error: {e}"
+
+
+@mcp.tool()
+def emu_capture_output(session_id: str, action: str = "start") -> str:
+    """Capture the guest's stdout/stderr ('io' capability, Qiling).
+
+    Call with action="start" BEFORE emu_run, then action="get" afterward to read
+    what the program printed.
+
+    session_id: Active session ID.
+    action: "start" to begin capturing, "get" to read what was captured.
+    """
+    try:
+        engine = sessions.get(session_id)
+        if action == "start":
+            engine.capture_output()
+            return "Output capture started. Run the program, then call with action='get'."
+        if action == "get":
+            out = engine.get_output()
+            return (f"--- stdout ---\n{out['stdout']}\n"
+                    f"--- stderr ---\n{out['stderr']}")
+        return "Error: action must be 'start' or 'get'."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except RuntimeError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Capture output error: {e}"
 
 
 @mcp.tool()

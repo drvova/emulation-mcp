@@ -90,6 +90,8 @@ class QilingEngine(BaseEngine):
 
     CAPABILITIES = frozenset({
         "binary_loading", "os_emulation", "address_hooks", "syscall_hooks", "api_hooks", "snapshots",
+        "memory_hooks", "callback_hooks", "disassembly", "register_introspection",
+        "filesystem", "io",
     })
     SUPPORTED_ARCHS = tuple(ARCH_MAP)
 
@@ -110,6 +112,9 @@ class QilingEngine(BaseEngine):
         self._ql_arch = resolve_arch(arch)
         self._ql_os = resolve_os(ostype)
         self._has_run = False
+        # Output-capture buffers, populated by capture_output().
+        self._cap_stdout: bytearray | None = None
+        self._cap_stderr: bytearray | None = None
 
         if args is None:
             args = []
@@ -249,15 +254,33 @@ class QilingEngine(BaseEngine):
 
     # -- Hooks: syscall --
 
-    def hook_syscall(self, name: str, callback: Callable | None = None) -> str:
+    _INTERCEPT = None  # lazily built {when: QL_INTERCEPT}
+
+    @classmethod
+    def _resolve_intercept(cls, when: str):
+        if cls._INTERCEPT is None:
+            cls._INTERCEPT = {
+                "call": QL_INTERCEPT.CALL,
+                "enter": QL_INTERCEPT.ENTER,
+                "exit": QL_INTERCEPT.EXIT,
+            }
+        key = str(when).lower().strip()
+        if key not in cls._INTERCEPT:
+            raise ValueError(f"when must be one of call/enter/exit, got {when!r}")
+        return cls._INTERCEPT[key]
+
+    def hook_syscall(self, name: str, callback: Callable | None = None, when: str = "call") -> str:
+        """Intercept a syscall. when='call' replaces it; 'enter'/'exit' observe
+        it around the real handler (leaving behaviour intact)."""
         self._touch()
         hook_id = self._gen_id("hsys-")
+        intercept = self._resolve_intercept(when)
 
         if callback is None:
             def callback(ql: Qiling, *args: Any, **kwargs: Any) -> Any:
                 entry = TraceEntry(
                     trace_type="syscall",
-                    name=name,
+                    name=f"{name}:{when}",
                     args=list(args),
                 )
                 try:
@@ -266,26 +289,29 @@ class QilingEngine(BaseEngine):
                     pass
                 self._append_trace(entry)
 
-        self.ql.os.set_syscall(name, callback, QL_INTERCEPT.CALL)
+        self.ql.os.set_syscall(name, callback, intercept)
         self.hooks[hook_id] = HookInfo(
             hook_id=hook_id,
             hook_type="syscall",
             target=name,
-            description=f"Syscall hook on '{name}'",
+            description=f"Syscall hook on '{name}' ({when})",
         )
         return hook_id
 
     # -- Hooks: API --
 
-    def hook_api(self, func_name: str, callback: Callable | None = None) -> str:
+    def hook_api(self, func_name: str, callback: Callable | None = None, when: str = "call") -> str:
+        """Intercept a library/API call. when='call' replaces it; 'enter'/'exit'
+        observe it around the real implementation."""
         self._touch()
         hook_id = self._gen_id("hapi-")
+        intercept = self._resolve_intercept(when)
 
         if callback is None:
             def callback(ql: Qiling, *args: Any, **kwargs: Any) -> Any:
                 entry = TraceEntry(
                     trace_type="api",
-                    name=func_name,
+                    name=f"{func_name}:{when}",
                     args=list(args),
                 )
                 try:
@@ -294,12 +320,12 @@ class QilingEngine(BaseEngine):
                     pass
                 self._append_trace(entry)
 
-        self.ql.os.set_api(func_name, callback, QL_INTERCEPT.CALL)
+        self.ql.os.set_api(func_name, callback, intercept)
         self.hooks[hook_id] = HookInfo(
             hook_id=hook_id,
             hook_type="api",
             target=func_name,
-            description=f"API hook on '{func_name}'",
+            description=f"API hook on '{func_name}' ({when})",
         )
         return hook_id
 
@@ -325,6 +351,82 @@ class QilingEngine(BaseEngine):
             target=f"0x{address:x}",
             description=f"Address hook at 0x{address:x}",
             _handle=handle,
+        )
+        return hook_id
+
+    # -- Hooks: fine-grained instrumentation (bottom-level) --
+
+    def _mem_hook_fn(self, kind: str):
+        return {
+            "read": self.ql.hook_mem_read,
+            "write": self.ql.hook_mem_write,
+            "unmapped": self.ql.hook_mem_unmapped,
+            "invalid": self.ql.hook_mem_invalid,
+        }.get(kind)
+
+    def add_mem_hook(self, callback: Callable, kind: str = "write",
+                     start: int | None = None, end: int | None = None) -> str:
+        """Fire a callback on guest memory access.
+
+        kind is "read", "write", "unmapped" or "invalid". The callback has
+        Qiling's native signature `cb(ql, access, address, size, value)`. start/end
+        bound the watched range (inclusive); omit both to watch everything. Returns
+        a hook id; remove with hook_remove(). Install before running.
+        """
+        self._touch()
+        hook_fn = self._mem_hook_fn(kind)
+        if hook_fn is None:
+            raise ValueError(f"kind must be read/write/unmapped/invalid, got {kind!r}")
+        # Qiling treats begin>end as "no range filter" (whole space).
+        begin = 1 if start is None else start
+        stop = 0 if end is None else end
+        handle = hook_fn(callback, begin=begin, end=stop)
+        hook_id = self._gen_id("hmem-")
+        self.hooks[hook_id] = HookInfo(
+            hook_id=hook_id, hook_type=f"mem_{kind}",
+            target=(f"0x{begin:x}-0x{stop:x}" if start is not None else "all"),
+            description=f"Memory {kind} hook", _handle=handle,
+        )
+        return hook_id
+
+    def add_code_hook(self, callback: Callable,
+                      start: int | None = None, end: int | None = None) -> str:
+        """Fire `cb(ql, address, size)` on every instruction (optionally in a range)."""
+        self._touch()
+        begin = 1 if start is None else start
+        stop = 0 if end is None else end
+        handle = self.ql.hook_code(callback, begin=begin, end=stop)
+        hook_id = self._gen_id("hcode-")
+        self.hooks[hook_id] = HookInfo(
+            hook_id=hook_id, hook_type="code",
+            target=(f"0x{begin:x}-0x{stop:x}" if start is not None else "all"),
+            description="Per-instruction code hook", _handle=handle,
+        )
+        return hook_id
+
+    def add_block_hook(self, callback: Callable,
+                       start: int | None = None, end: int | None = None) -> str:
+        """Fire `cb(ql, address, size)` on every basic block (optionally in a range)."""
+        self._touch()
+        begin = 1 if start is None else start
+        stop = 0 if end is None else end
+        handle = self.ql.hook_block(callback, begin=begin, end=stop)
+        hook_id = self._gen_id("hblk-")
+        self.hooks[hook_id] = HookInfo(
+            hook_id=hook_id, hook_type="block",
+            target=(f"0x{begin:x}-0x{stop:x}" if start is not None else "all"),
+            description="Per-block hook", _handle=handle,
+        )
+        return hook_id
+
+    def add_intr_hook(self, callback: Callable) -> str:
+        """Fire `cb(ql, intno)` on every interrupt/exception."""
+        self._touch()
+        handle = self.ql.hook_intr(callback)
+        hook_id = self._gen_id("hintr-")
+        self.hooks[hook_id] = HookInfo(
+            hook_id=hook_id, hook_type="interrupt", target="all",
+            description="Interrupt hook", _handle=handle,
         )
         return hook_id
 
@@ -366,6 +468,58 @@ class QilingEngine(BaseEngine):
         except Exception as e:
             raise RuntimeError(f"Memory search failed: {e}") from e
 
+    def memory_maps(self) -> list[dict[str, Any]]:
+        """List the mapped regions as (start, end, perms, label, path)."""
+        self._touch()
+        out: list[dict[str, Any]] = []
+        try:
+            rows = self.ql.mem.get_mapinfo()
+        except Exception as e:
+            raise RuntimeError(f"Memory-map listing failed: {e}") from e
+        for row in rows:
+            start, end, perms, label = row[0], row[1], row[2], row[3]
+            path = row[4] if len(row) > 4 else ""
+            out.append({"start": start, "end": end, "perms": perms,
+                        "label": label, "path": path})
+        return out
+
+    def read_string(self, address: int, max_len: int = 1024) -> str:
+        """Read a NUL-terminated string (decoding undecodable bytes leniently)."""
+        self._touch()
+        try:
+            raw = bytes(self.ql.mem.read(address, max_len))
+        except Exception as e:
+            raise RuntimeError(f"String read failed at 0x{address:x}: {e}") from e
+        nul = raw.find(b"\x00")
+        if nul != -1:
+            raw = raw[:nul]
+        return raw.decode("utf-8", errors="replace")
+
+    # -- Disassembly --
+
+    def disassemble(self, address: int, count: int = 1) -> list[dict[str, Any]]:
+        """Disassemble `count` instructions at `address` using Qiling's capstone."""
+        self._touch()
+        md = self.ql.arch.disassembler
+        # Read enough bytes for `count` instructions (max x86 insn is 15 bytes).
+        try:
+            code = bytes(self.ql.mem.read(address, max(count, 1) * 15 + 16))
+        except Exception as e:
+            raise RuntimeError(f"Disassembly read failed at 0x{address:x}: {e}") from e
+        out: list[dict[str, Any]] = []
+        for insn in md.disasm(code, address):
+            out.append({
+                "address": f"0x{insn.address:x}",
+                "instruction": f"{insn.mnemonic} {insn.op_str}".strip(),
+                "mnemonic": insn.mnemonic,
+                "op_str": insn.op_str,
+                "size": insn.size,
+                "bytes": insn.bytes.hex(),
+            })
+            if len(out) >= count:
+                break
+        return out
+
     # -- Registers --
 
     def register_read(self, name: str) -> int:
@@ -389,6 +543,18 @@ class QilingEngine(BaseEngine):
             except (AttributeError, Exception):
                 pass
         return result
+
+    def list_registers(self) -> dict[str, dict[str, int]]:
+        """Enumerate the architecture's full register file with current values."""
+        self._touch()
+        out: dict[str, dict[str, int]] = {}
+        mapping = getattr(self.ql.arch.regs, "register_mapping", {}) or {}
+        for name in mapping:
+            try:
+                out[name] = {"value": int(getattr(self.ql.arch.regs, name))}
+            except Exception:
+                continue
+        return out
 
     # -- Snapshots --
 
@@ -417,6 +583,78 @@ class QilingEngine(BaseEngine):
         except Exception as e:
             raise RuntimeError(f"Snapshot restore failed: {e}") from e
 
+    # -- Filesystem & I/O (Qiling's binary-emulation power) --
+
+    def add_fs_mapper(self, guest_path: str, host_path: str) -> None:
+        """Map a host file or directory to a path inside the emulated FS.
+
+        The guest sees `host_path`'s contents when it opens `guest_path`. Use it
+        to supply config files, device nodes, or a /flag the target reads.
+        """
+        self._touch()
+        if not os.path.exists(host_path):
+            raise FileNotFoundError(f"Host path does not exist: {host_path}")
+        try:
+            self.ql.add_fs_mapper(guest_path, host_path)
+        except Exception as e:
+            raise RuntimeError(f"Filesystem mapping failed ({guest_path} -> {host_path}): {e}") from e
+
+    def set_stdin(self, data: bytes) -> None:
+        """Preload the guest's standard input with `data`."""
+        self._touch()
+        from qiling.os.posix.filestruct import ql_pipe
+        rd, wr = ql_pipe.open()
+        try:
+            wr.write(bytes(data))
+        except Exception as e:
+            raise RuntimeError(f"stdin injection failed: {e}") from e
+        self.ql.os.stdin = rd
+
+    def capture_output(self) -> None:
+        """Begin capturing the guest's stdout and stderr (call before run)."""
+        self._touch()
+        self._cap_stdout = bytearray()
+        self._cap_stderr = bytearray()
+        self._wrap_stream(self.ql.os.stdout, self._cap_stdout)
+        self._wrap_stream(self.ql.os.stderr, self._cap_stderr)
+
+    @staticmethod
+    def _wrap_stream(stream: Any, buffer: bytearray) -> None:
+        # Qiling may share one stdout/stderr object across instances, so save the
+        # true original once and always re-point the tee to the current buffer
+        # (the latest capture_output wins). Restored in close().
+        original = getattr(stream, "_emu_orig_write", None) or stream.write
+        stream._emu_orig_write = original
+
+        def _tee(data: Any) -> Any:
+            try:
+                buffer.extend(bytes(data))
+            except Exception:
+                pass
+            return original(data)
+
+        stream.write = _tee
+
+    @staticmethod
+    def _unwrap_stream(stream: Any) -> None:
+        original = getattr(stream, "_emu_orig_write", None)
+        if original is not None:
+            stream.write = original
+            try:
+                del stream._emu_orig_write
+            except Exception:
+                pass
+
+    def get_output(self) -> dict[str, str]:
+        """Return the stdout/stderr captured since capture_output()."""
+        self._touch()
+        if self._cap_stdout is None:
+            raise RuntimeError("Output capture not started; call capture_output() first.")
+        return {
+            "stdout": bytes(self._cap_stdout).decode("utf-8", errors="replace"),
+            "stderr": bytes(self._cap_stderr).decode("utf-8", errors="replace"),
+        }
+
     # -- Lifecycle --
 
     def close(self) -> None:
@@ -424,6 +662,13 @@ class QilingEngine(BaseEngine):
             self.ql.stop()
         except Exception:
             pass
+        # Restore any stdout/stderr write wrappers installed by capture_output().
+        if self._cap_stdout is not None:
+            try:
+                self._unwrap_stream(self.ql.os.stdout)
+                self._unwrap_stream(self.ql.os.stderr)
+            except Exception:
+                pass
         self.hooks.clear()
         self.snapshots.clear()
         self.trace.clear()
