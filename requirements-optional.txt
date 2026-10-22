@@ -1,0 +1,15 @@
+# Optional emulation engines. Install with:
+#   pip install -r requirements-optional.txt
+# or pick individual engines. Each engine is loaded lazily, so the server runs
+# fine with only the core requirements.txt installed; emu_list_engines reports
+# which engines are available.
+
+# Icicle -- CPU emulator built on Ghidra SLEIGH semantics.
+# Adds RISC-V, PowerPC, MSP430, ... and cross-checks Unicorn results.
+# The PyPI wheel exposes a subset of Icicle; for the full surface (reverse
+# execution, native snapshots, SLEIGH disassembly, call stacks, Linux userspace
+# emulation) build the extended binding instead: ./icicle_ext/build.sh
+icicle-emu>=0.0.11
+
+# angr -- symbolic execution (symbolic inputs, path exploration, constraint solving).
+angr>=9.2

@@ -20,7 +20,11 @@ from capstone import Cs, CS_ARCH_X86, CS_ARCH_ARM, CS_ARCH_ARM64, CS_ARCH_MIPS
 from capstone import CS_MODE_32, CS_MODE_64, CS_MODE_ARM, CS_MODE_THUMB
 from capstone import CS_MODE_MIPS32, CS_MODE_MIPS64, CS_MODE_BIG_ENDIAN, CS_MODE_LITTLE_ENDIAN
 
-from .base import BaseEngine, HookInfo, SnapshotInfo, TraceEntry
+from .base import (
+    BaseEngine, HookInfo, SnapshotInfo, TraceEntry,
+    CODE_BASE, CODE_SIZE, STACK_BASE, STACK_SIZE, STACK_TOP,
+    HEAP_BASE, HEAP_SIZE,
+)
 
 import time
 
@@ -104,17 +108,6 @@ REG_MAPS: dict[str, dict[str, int]] = {
     "mips64": _MIPS_REGS,
 }
 
-# Default memory layout
-CODE_BASE = 0x1000000
-CODE_SIZE = 4 * 1024 * 1024      # 4 MB
-STACK_BASE = 0x7000000
-STACK_SIZE = 1 * 1024 * 1024     # 1 MB
-STACK_TOP = STACK_BASE + STACK_SIZE  # 0x7100000
-HEAP_BASE = 0x8000000
-HEAP_SIZE = 2 * 1024 * 1024      # 2 MB
-DATA_BASE = 0x2000000
-DATA_SIZE = 2 * 1024 * 1024      # 2 MB - for user data (strings, buffers)
-
 # Stack pointer register per architecture
 SP_REG: dict[str, str] = {
     "x86": "esp",
@@ -161,6 +154,11 @@ def _translate_uc_error(err: UcError) -> str:
 
 class UnicornEngine(BaseEngine):
     """Unicorn CPU emulator engine for code snippet and shellcode analysis."""
+
+    CAPABILITIES = frozenset({
+        "shellcode", "address_hooks", "instruction_trace", "memory_trace", "snapshots",
+    })
+    SUPPORTED_ARCHS = tuple(ARCH_MAP)
 
     def __init__(self, arch: str, **kwargs: Any):
         if arch not in ARCH_MAP:
@@ -237,7 +235,15 @@ class UnicornEngine(BaseEngine):
         # _handle is always callable when set (guaranteed by hook_address()), so
         # a simple None-check is sufficient — no callable() overhead needed.
         hook_info = self._addr_hooks.get(address)
-        if hook_info is not None and hook_info._handle is not None:
+        if hook_info is not None:
+            if hook_info._handle is None:
+                self._append_trace(TraceEntry(
+                    address=address,
+                    instruction=hook_info.description,
+                    trace_type="hook",
+                    name=f"hook@0x{address:x}",
+                ))
+                return
             try:
                 hook_info._handle(self, address)
             except Exception as e:
@@ -444,13 +450,25 @@ class UnicornEngine(BaseEngine):
 
     def snapshot_save(self, label: str = "") -> str:
         self._touch()
+        # context_save captures registers only; also capture mapped memory so a
+        # restore fully resets state (needed e.g. for the fuzzing loop). Each
+        # region's bytes are stored unless the whole region is zero.
         ctx = self.uc.context_save()
+        mem: list[tuple[int, bytes]] = []
+        for begin, end, _perms in self.uc.mem_regions():
+            size = end - begin + 1
+            try:
+                data = bytes(self.uc.mem_read(begin, size))
+            except UcError:
+                continue
+            if data.strip(b"\x00"):
+                mem.append((begin, data))
         snap_id = self._gen_id("snap-")
         self.snapshots[snap_id] = SnapshotInfo(
             snapshot_id=snap_id,
             label=label or f"Snapshot {len(self.snapshots) + 1}",
             created_at=time.time(),
-            _data=ctx,
+            _data={"ctx": ctx, "mem": mem, "regions": list(self.uc.mem_regions())},
         )
         return snap_id
 
@@ -459,7 +477,21 @@ class UnicornEngine(BaseEngine):
         snap = self.snapshots.get(snapshot_id)
         if snap is None:
             raise KeyError(f"Snapshot '{snapshot_id}' not found. Available: {list(self.snapshots.keys())}")
-        self.uc.context_restore(snap._data)
+        data = snap._data
+        # Zero the regions that were mapped at save time, then restore the saved
+        # bytes, so memory written since the snapshot is rolled back too.
+        for begin, end, _perms in data["regions"]:
+            size = end - begin + 1
+            try:
+                self.uc.mem_write(begin, b"\x00" * size)
+            except UcError:
+                pass
+        for begin, chunk in data["mem"]:
+            try:
+                self.uc.mem_write(begin, chunk)
+            except UcError:
+                pass
+        self.uc.context_restore(data["ctx"])
 
     # -- Lifecycle --
 

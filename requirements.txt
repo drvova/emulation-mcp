@@ -1,4 +1,10 @@
+# Core server + the default (Unicorn) engine
 fastmcp>=2.0.0
 unicorn>=2.1.0
-qiling>=1.4.6
 capstone>=5.0.0
+
+# Qiling: full binary / OS-level emulation (needs a rootfs at runtime).
+qiling>=1.4.6
+
+# Further optional engines (Icicle, angr) live in requirements-optional.txt.
+# All engines load lazily; emu_list_engines shows which are installed.

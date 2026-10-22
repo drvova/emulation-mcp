@@ -3,20 +3,10 @@
 import sys
 import os
 
-# Allow running as standalone script.
-# Temporarily stub out qiling_engine to avoid ImportError from engines/__init__.py
+# Allow running as standalone script. The engines package imports backends
+# lazily, so importing the Unicorn engine alone does not require qiling/icicle/angr.
 _project_root = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _project_root)
-
-# Create a stub for qiling_engine so engines/__init__.py doesn't fail
-import types
-_stub = types.ModuleType("engines.qiling_engine")
-
-class _QilingEngineStub:
-    pass
-
-_stub.QilingEngine = _QilingEngineStub
-sys.modules["engines.qiling_engine"] = _stub
 
 from engines.unicorn_engine import UnicornEngine, CODE_BASE
 
@@ -178,6 +168,26 @@ def test_snapshot_save_restore():
     print("  PASS: test_snapshot_save_restore")
 
 
+def test_snapshot_memory_rollback():
+    """Snapshots roll back memory as well as registers."""
+    eng = UnicornEngine(arch="x86_64")
+
+    eng.memory_write(CODE_BASE, b"\xAA\xBB\xCC\xDD")
+    snap_id = eng.snapshot_save("mem")
+
+    # Mutate existing bytes and write to a region that was zero at save time.
+    eng.memory_write(CODE_BASE, b"\x00\x11\x22\x33")
+    eng.memory_write(CODE_BASE + 0x40, b"\xFF\xFF")
+    assert eng.memory_read(CODE_BASE, 4) == b"\x00\x11\x22\x33"
+
+    eng.snapshot_restore(snap_id)
+    assert eng.memory_read(CODE_BASE, 4) == b"\xAA\xBB\xCC\xDD", "saved bytes not restored"
+    assert eng.memory_read(CODE_BASE + 0x40, 2) == b"\x00\x00", "post-snapshot write not rolled back"
+
+    eng.close()
+    print("  PASS: test_snapshot_memory_rollback")
+
+
 def test_memory_search():
     """Test searching for byte patterns in mapped memory."""
     eng = UnicornEngine(arch="x86_64")
@@ -324,6 +334,7 @@ ALL_TESTS = [
     test_execute_shellcode,
     test_step,
     test_snapshot_save_restore,
+    test_snapshot_memory_rollback,
     test_memory_search,
     test_memory_map,
     test_hook_address,
