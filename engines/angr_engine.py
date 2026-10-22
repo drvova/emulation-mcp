@@ -71,13 +71,33 @@ MAX_EXPLORE_STATES = 2000
 PAGE_SIZE = 0x1000
 
 
+class _ReturnValueProcedure(angr.SimProcedure):
+    """A SimProcedure that returns immediately with a fixed concrete value.
+
+    The value is carried on a ``RET_VALUE`` class attribute so one subclass is
+    minted per hooked function (see AngrEngine.hook_function).
+    """
+    RET_VALUE = 0
+
+    def run(self):  # noqa: D401 - angr calls this with the guest's args
+        return claripy.BVV(self.RET_VALUE, self.state.arch.bits)
+
+
 class AngrEngine(BaseEngine):
     """angr symbolic/concrete execution engine."""
 
     CAPABILITIES = frozenset({
         "shellcode", "binary_loading", "address_hooks",
         "instruction_trace", "snapshots", "symbolic",
-        "cfg", "function_call",
+        "cfg", "function_call", "decompiler", "constraints",
+        "inspection", "sim_procedures",
+    })
+
+    # state.inspect events we accept for add_inspect_hook.
+    INSPECT_EVENTS = frozenset({
+        "mem_read", "mem_write", "reg_read", "reg_write", "address_concretization",
+        "instruction", "statement", "expr", "call", "return", "fork",
+        "symbolic_variable", "constraints", "exit", "syscall", "irsb", "dirty",
     })
     SUPPORTED_ARCHS = tuple(ARCH_MAP)
 
@@ -438,6 +458,86 @@ class AngrEngine(BaseEngine):
             pass
         return hook_id
 
+    def add_inspect_hook(self, event: str, callback: Callable, when: str = "before") -> str:
+        """Register a callback on a fine-grained angr event (state.inspect).
+
+        event: one of INSPECT_EVENTS — "mem_read", "mem_write", "reg_read",
+          "reg_write", "instruction", "call", "return", "symbolic_variable", ...
+        when: "before" or "after" the event.
+        The callback receives the angr `SimState`; read the event details from
+        `state.inspect.attrs` (e.g. `.mem_write_address`, `.mem_write_expr`).
+        It is observe-only and must not re-enter this engine. Breakpoints are
+        copied into child states, so they fire throughout start()/explore().
+        Install before running; remove with hook_remove().
+        """
+        self._touch()
+        if event not in self.INSPECT_EVENTS:
+            raise ValueError(
+                f"Unknown inspect event '{event}'. Known: {sorted(self.INSPECT_EVENTS)}"
+            )
+        when_const = angr.BP_AFTER if str(when).lower() == "after" else angr.BP_BEFORE
+        bp = self.state.inspect.b(event, when=when_const, action=callback)
+        hook_id = self._gen_id("insp-")
+        info = HookInfo(
+            hook_id=hook_id,
+            hook_type="inspect",
+            target=f"{event}:{when}",
+            description=f"Inspect {event} ({when})",
+            _handle=(event, bp),
+        )
+        self.hooks[hook_id] = info
+        return hook_id
+
+    def hook_function(self, address: int, return_value: int | None = None) -> str:
+        """Replace the function at `address` with a stub that returns at once.
+
+        return_value: force this concrete return value; None returns an
+        unconstrained symbolic value (ReturnUnconstrained). Useful to stub out
+        library/checksum functions during symbolic exploration. Remove with
+        hook_remove().
+        """
+        self._touch()
+        clean = self._clean_addr(address)
+        if return_value is None:
+            proc = angr.SIM_PROCEDURES["stubs"]["ReturnUnconstrained"]()
+            desc = f"hook_function 0x{address:x} -> unconstrained"
+        else:
+            proc_cls = type("ReturnValue", (_ReturnValueProcedure,),
+                            {"RET_VALUE": int(return_value)})
+            proc = proc_cls()
+            desc = f"hook_function 0x{address:x} -> {return_value:#x}"
+        try:
+            self.proj.hook(clean, proc, replace=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to hook 0x{address:x}: {e}") from e
+        hook_id = self._gen_id("simproc-")
+        self.hooks[hook_id] = HookInfo(
+            hook_id=hook_id, hook_type="sim_procedure",
+            target=f"0x{address:x}", description=desc, _handle=clean,
+        )
+        return hook_id
+
+    def hook_skip(self, address: int, length: int = 0) -> str:
+        """No-op `length` bytes at `address` (skip an instruction/sequence).
+
+        angr jumps over the hooked bytes without executing them. length=0 lets
+        the stub run in place of the block. Remove with hook_remove().
+        """
+        self._touch()
+        clean = self._clean_addr(address)
+        try:
+            self.proj.hook(clean, angr.SIM_PROCEDURES["stubs"]["Nop"](),
+                           length=max(length, 0), replace=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to hook-skip 0x{address:x}: {e}") from e
+        hook_id = self._gen_id("skip-")
+        self.hooks[hook_id] = HookInfo(
+            hook_id=hook_id, hook_type="skip",
+            target=f"0x{address:x}", description=f"skip 0x{address:x} (+{length})",
+            _handle=clean,
+        )
+        return hook_id
+
     def hook_remove(self, hook_id: str) -> bool:
         self._touch()
         info = self.hooks.get(hook_id)
@@ -449,6 +549,18 @@ class AngrEngine(BaseEngine):
             try:
                 if self.proj.is_hooked(self._clean_addr(addr)):
                     self.proj.unhook(self._clean_addr(addr))
+            except Exception:
+                pass
+        elif info.hook_type == "inspect" and info._handle:
+            event, bp = info._handle
+            try:
+                self.state.inspect.remove_breakpoint(event, bp)
+            except Exception:
+                pass
+        elif info.hook_type in ("sim_procedure", "skip") and info._handle is not None:
+            try:
+                if self.proj.is_hooked(info._handle):
+                    self.proj.unhook(info._handle)
             except Exception:
                 pass
         del self.hooks[hook_id]
@@ -615,6 +727,59 @@ class AngrEngine(BaseEngine):
     def list_symbolic(self) -> list[dict[str, Any]]:
         return [{"name": n, "bits": s.size()} for n, s in self._symvars.items()]
 
+    # -- Constraints & solver introspection (angr-specific) --
+
+    _OPS = {
+        "==": lambda a, b: a == b, "eq": lambda a, b: a == b,
+        "!=": lambda a, b: a != b, "ne": lambda a, b: a != b,
+        "<":  lambda a, b: a < b,  "lt": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b, "le": lambda a, b: a <= b,
+        ">":  lambda a, b: a > b,  "gt": lambda a, b: a > b,
+        ">=": lambda a, b: a >= b, "ge": lambda a, b: a >= b,
+    }
+
+    def _solver_state(self) -> Any:
+        """The state carrying the live constraints (a found path, else current)."""
+        return self._found_states[0] if self._found_states else self.state
+
+    def add_constraint(self, var_name: str, op: str, value: int) -> dict[str, Any]:
+        """Add a constraint `<var> <op> <value>` to the current state.
+
+        op is one of ==,!=,<,<=,>,>= (or eq/ne/lt/le/gt/ge). Comparisons are
+        unsigned. Returns the running satisfiability after adding it.
+        """
+        self._touch()
+        sym = self._symvars.get(var_name)
+        if sym is None:
+            raise KeyError(f"Unknown symbolic variable '{var_name}'. Known: {list(self._symvars.keys())}")
+        fn = self._OPS.get(str(op).strip().lower())
+        if fn is None:
+            raise ValueError(f"Unknown operator '{op}'. Use one of {sorted(self._OPS)}")
+        self.state.solver.add(fn(sym, claripy.BVV(value, sym.size())))
+        return {"variable": var_name, "op": op, "value": value,
+                "satisfiable": bool(self.state.solver.satisfiable())}
+
+    def value_range(self, var_name: str) -> dict[str, Any]:
+        """Return the min and max concrete value a symbolic variable can take."""
+        self._touch()
+        sym = self._symvars.get(var_name)
+        if sym is None:
+            raise KeyError(f"Unknown symbolic variable '{var_name}'. Known: {list(self._symvars.keys())}")
+        state = self._solver_state()
+        try:
+            lo = state.solver.min(sym)
+            hi = state.solver.max(sym)
+        except Exception as e:
+            return {"variable": var_name, "error": f"{type(e).__name__}: {e}"}
+        unique = lo == hi
+        return {"variable": var_name, "bits": sym.size(),
+                "min": lo, "max": hi, "unique": unique}
+
+    def is_satisfiable(self) -> bool:
+        """Whether the current state's accumulated constraints are satisfiable."""
+        self._touch()
+        return bool(self.state.solver.satisfiable())
+
     # -- Static analysis (angr-specific) --
 
     def recover_cfg(self, fast: bool = True) -> dict[str, Any]:
@@ -686,6 +851,87 @@ class AngrEngine(BaseEngine):
             "args": args,
             "return_value": {"hex": f"0x{val:x}", "int": val} if val is not None else None,
         }
+
+    def _ensure_cfg(self):
+        if getattr(self, "_cfg", None) is None:
+            self.recover_cfg(fast=True)
+        return self._cfg
+
+    def _lookup_function(self, address: int):
+        clean = self._clean_addr(address)
+        funcs = self.proj.kb.functions
+        try:
+            return funcs.get_by_addr(clean)
+        except KeyError:
+            return funcs.get(clean) if clean in funcs else None
+
+    def decompile_function(self, address: int) -> dict[str, Any]:
+        """Decompile the function at `address` to pseudo-C (runs CFG first)."""
+        self._touch()
+        try:
+            cfg = self._ensure_cfg()
+        except Exception as e:
+            return {"error": f"CFG recovery failed: {type(e).__name__}: {e}"}
+        fn = self._lookup_function(address)
+        if fn is None:
+            return {"error": f"No function recovered at 0x{address:x}. "
+                             f"Run emu_cfg / check emu_function_info first."}
+        try:
+            dec = self.proj.analyses.Decompiler(fn, cfg=cfg.model)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        code = getattr(getattr(dec, "codegen", None), "text", None)
+        if not code:
+            return {"error": "Decompiler produced no output (unsupported function)."}
+        return {"address": f"0x{fn.addr:x}", "name": fn.name, "code": code}
+
+    def function_info(self, address: int) -> dict[str, Any]:
+        """Metadata about one recovered function: flags, blocks, callers, callees."""
+        self._touch()
+        try:
+            cfg = self._ensure_cfg()
+        except Exception as e:
+            return {"error": f"CFG recovery failed: {type(e).__name__}: {e}"}
+        fn = self._lookup_function(address)
+        if fn is None:
+            return {"error": f"No function recovered at 0x{address:x}."}
+        callgraph = cfg.functions.callgraph
+        funcs = self.proj.kb.functions
+
+        def _names(addrs):
+            out = []
+            for a in addrs:
+                try:
+                    out.append(funcs.get_by_addr(a).name)
+                except Exception:
+                    out.append(f"0x{a:x}")
+            return out
+
+        callers = _names(callgraph.predecessors(fn.addr)) if fn.addr in callgraph else []
+        callees = _names(callgraph.successors(fn.addr)) if fn.addr in callgraph else []
+        try:
+            nblocks = len(list(fn.blocks))
+        except Exception:
+            nblocks = 0
+        info: dict[str, Any] = {
+            "address": f"0x{fn.addr:x}",
+            "name": fn.name,
+            "size": getattr(fn, "size", 0),
+            "blocks": nblocks,
+            "returning": bool(getattr(fn, "returning", False)),
+            "is_plt": bool(getattr(fn, "is_plt", False)),
+            "is_syscall": bool(getattr(fn, "is_syscall", False)),
+            "callers": sorted(set(callers)),
+            "callees": sorted(set(callees)),
+        }
+        # Calling convention / prototype are best-effort (may be None).
+        cc = getattr(fn, "calling_convention", None)
+        if cc is not None:
+            info["calling_convention"] = str(cc)
+        proto = getattr(fn, "prototype", None)
+        if proto is not None:
+            info["prototype"] = str(proto)
+        return info
 
     # -- Lifecycle --
 

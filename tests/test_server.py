@@ -525,6 +525,70 @@ class TestAngrThroughServer(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
+    def test_decompile_and_function_info_via_server(self):
+        sid = _new_session(engine="angr", arch="x86_64")
+        try:
+            _fn(server.emu_memory_write)(sid, "0x1000000", "8d0437c3")  # add; ret
+            _fn(server.emu_cfg)(sid)
+            info = _fn(server.emu_function_info)(sid, "0x1000000")
+            self.assertIn("returning=True", info)
+            dec = _fn(server.emu_decompile)(sid, "0x1000000")
+            self.assertIn("return", dec)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_constrain_and_value_range_via_server(self):
+        sid = _new_session(engine="angr", arch="x86_64")
+        try:
+            var = _fn(server.emu_set_symbolic_register)(sid, "rdi").split("Variable:", 1)[1].strip()
+            # Decimal is decimal (not hex): >10 and <20 -> [11, 19].
+            self.assertIn("satisfiable", _fn(server.emu_constrain)(sid, var, ">", "10"))
+            _fn(server.emu_constrain)(sid, var, "<", "20")
+            rng = _fn(server.emu_value_range)(sid, var)
+            self.assertIn("min=0xb (11)", rng)
+            self.assertIn("max=0x13 (19)", rng)
+            # Over-constrain -> reported unsatisfiable.
+            self.assertIn("UNSATISFIABLE", _fn(server.emu_constrain)(sid, var, ">", "100"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_hook_function_via_server(self):
+        sid = _new_session(engine="angr", arch="x86_64")
+        try:
+            _fn(server.emu_memory_write)(sid, "0x1000000", "8d0437c3")  # add; ret
+            self.assertIn("(7)", _fn(server.emu_call_function)(sid, "0x1000000", ["3", "4"]))
+            out = _fn(server.emu_hook_function)(sid, "0x1000000", "99")  # decimal 99
+            self.assertIn("Hook ID:", out)
+            self.assertIn("(99)", _fn(server.emu_call_function)(sid, "0x1000000", ["3", "4"]))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_inspect_hook_via_eval(self):
+        """state.inspect breakpoints are driveable through emu_eval."""
+        orig = server.ENABLE_EVAL
+        server.ENABLE_EVAL = True
+        sid = _new_session(engine="angr", arch="x86_64")
+        try:
+            out = _fn(server.emu_eval)(sid,
+                "seen = []\n"
+                "engine.add_inspect_hook('mem_write',\n"
+                "    lambda s: seen.append(s.solver.eval(s.inspect.attrs.mem_write_address)))\n"
+                "engine.memory_write(0x8000000, b'\\xaa\\xbb\\xcc\\xdd')\n"
+                "result = '0x%x' % seen[0]")
+            self.assertIn("0x8000000", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+            server.ENABLE_EVAL = orig
+
+    def test_new_tools_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_decompile)(sid, "0x1000000"))
+            self.assertIn("not supported", _fn(server.emu_hook_function)(sid, "0x1000000"))
+            self.assertIn("not supported", _fn(server.emu_constrain)(sid, "x", "==", "1"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
     def test_binary_mode(self):
         if not os.path.exists("/bin/true"):
             self.skipTest("/bin/true not available")

@@ -83,6 +83,10 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "gdb": "Serve a GDB remote stub so a real debugger can attach",
     "cfg": "Recover a control-flow graph and list functions",
     "function_call": "Execute a function with concrete args (calling-convention aware)",
+    "decompiler": "Decompile a function to pseudo-C",
+    "constraints": "Add solver constraints and query value ranges/satisfiability",
+    "inspection": "Register callbacks on fine-grained events (mem/reg/instruction breakpoints)",
+    "sim_procedures": "Replace or skip functions with Python stubs (SimProcedures)",
     "callback_hooks": "Register Python callbacks that fire during emulation",
     "memory_hooks": "Register Python callbacks on guest memory reads/writes (watchpoints)",
     "wide_registers": "Read/write registers wider than 64 bits (vector/flag aggregates)",
@@ -250,6 +254,38 @@ class BaseEngine(ABC):
     def call_function(self, address: int, args: list[int] | None = None) -> dict[str, Any]:
         """Execute a function with concrete args. 'function_call' capability."""
         raise NotImplementedError(f"Function calls are not supported by the '{self.engine_type}' engine")
+
+    def decompile_function(self, address: int) -> dict[str, Any]:
+        """Decompile a function to pseudo-C. 'decompiler' capability."""
+        raise NotImplementedError(f"Decompilation is not supported by the '{self.engine_type}' engine")
+
+    def function_info(self, address: int) -> dict[str, Any]:
+        """Return metadata about one recovered function. 'cfg' capability."""
+        raise NotImplementedError(f"Function info is not supported by the '{self.engine_type}' engine")
+
+    def add_constraint(self, var_name: str, op: str, value: int) -> dict[str, Any]:
+        """Constrain a symbolic variable (op in ==,!=,<,<=,>,>=). 'constraints'."""
+        raise NotImplementedError(f"Constraints are not supported by the '{self.engine_type}' engine")
+
+    def value_range(self, var_name: str) -> dict[str, Any]:
+        """Return the min/max concrete value of a symbolic variable. 'constraints'."""
+        raise NotImplementedError(f"Constraints are not supported by the '{self.engine_type}' engine")
+
+    def is_satisfiable(self) -> bool:
+        """Whether the current state's constraints are satisfiable. 'constraints'."""
+        raise NotImplementedError(f"Constraints are not supported by the '{self.engine_type}' engine")
+
+    def add_inspect_hook(self, event: str, callback: Callable, when: str = "before") -> str:
+        """Register a callback on a fine-grained event (mem/reg/instruction). 'inspection'."""
+        raise NotImplementedError(f"Event inspection is not supported by the '{self.engine_type}' engine")
+
+    def hook_function(self, address: int, return_value: int | None = None) -> str:
+        """Replace a function with a stub that returns immediately. 'sim_procedures'."""
+        raise NotImplementedError(f"Function hooks are not supported by the '{self.engine_type}' engine")
+
+    def hook_skip(self, address: int, length: int = 0) -> str:
+        """Skip `length` bytes at `address` (no-op them). 'sim_procedures'."""
+        raise NotImplementedError(f"Skip hooks are not supported by the '{self.engine_type}' engine")
 
     def add_callback_hook(self, callback: Callable, address: int | None = None) -> str:
         """Register a Python callback fired during emulation. 'callback_hooks'."""

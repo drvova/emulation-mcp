@@ -244,6 +244,20 @@ def _parse_addr(addr: str | int) -> int:
     return val
 
 
+def _parse_int(value: str | int) -> int:
+    """Parse an integer VALUE (not an address): decimal by default, 0x => hex.
+
+    Unlike _parse_addr, a bare "10" means ten, not sixteen — the right default
+    for constraint bounds and forced return values. Negative values are allowed.
+    """
+    if isinstance(value, int):
+        return value
+    value = value.strip()
+    if value.lower().startswith(("0x", "-0x", "+0x")):
+        return int(value, 16)
+    return int(value, 10)
+
+
 def _hex_dump(data: bytes, base_addr: int = 0, width: int = 16) -> str:
     """Format bytes as a hex dump string."""
     lines = []
@@ -2523,6 +2537,163 @@ def emu_call_function(session_id: str, address: str, args: list[str] | None = No
         return str(e)
     except Exception as e:
         return f"Call function error: {e}"
+
+
+@mcp.tool()
+def emu_decompile(session_id: str, address: str) -> str:
+    """Decompile a function to pseudo-C ('decompiler' capability, angr).
+
+    Recovers a CFG first if needed, then runs angr's decompiler on the function
+    containing `address`.
+
+    session_id: Active session ID.
+    address: Hex address of the function (its entry point).
+    """
+    try:
+        engine = sessions.get(session_id)
+        result = engine.decompile_function(_parse_addr(address))
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"// {result['name']} @ {result['address']}\n{result['code']}")
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Decompile error: {e}"
+
+
+@mcp.tool()
+def emu_function_info(session_id: str, address: str) -> str:
+    """Show metadata about one recovered function ('cfg' capability, angr).
+
+    Reports size, block count, returning/PLT/syscall flags, and the function's
+    callers and callees. Recovers a CFG first if needed.
+
+    session_id: Active session ID.
+    address: Hex address of the function.
+    """
+    try:
+        engine = sessions.get(session_id)
+        info = engine.function_info(_parse_addr(address))
+        if "error" in info:
+            return f"Error: {info['error']}"
+        lines = [
+            f"{info['name']} @ {info['address']}",
+            f"  size={info['size']} blocks={info['blocks']} returning={info['returning']}"
+            f" plt={info['is_plt']} syscall={info['is_syscall']}",
+        ]
+        if info.get("prototype"):
+            lines.append(f"  prototype: {info['prototype']}")
+        if info.get("calling_convention"):
+            lines.append(f"  cc: {info['calling_convention']}")
+        lines.append(f"  callers: {', '.join(info['callers']) or '(none)'}")
+        lines.append(f"  callees: {', '.join(info['callees']) or '(none)'}")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Function info error: {e}"
+
+
+@mcp.tool()
+def emu_constrain(session_id: str, variable: str, op: str, value: str) -> str:
+    """Add a constraint on a symbolic variable ('constraints' capability, angr).
+
+    Narrows the solver so later emu_solve / emu_value_range calls respect it.
+
+    session_id: Active angr session.
+    variable: Symbolic variable name (from emu_set_symbolic_*).
+    op: One of ==, !=, <, <=, >, >= (comparisons are unsigned).
+    value: Integer bound (decimal or hex string).
+    """
+    try:
+        engine = sessions.get(session_id)
+        result = engine.add_constraint(variable, op, _parse_int(value))
+        sat = "satisfiable" if result["satisfiable"] else "UNSATISFIABLE (over-constrained)"
+        return f"Constraint added: {variable} {op} {value}. State is now {sat}."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except (KeyError, ValueError) as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Constrain error: {e}"
+
+
+@mcp.tool()
+def emu_value_range(session_id: str, variable: str) -> str:
+    """Report the min/max a symbolic variable can take ('constraints', angr).
+
+    Respects all constraints added so far (and the most recent exploration).
+
+    session_id: Active angr session.
+    variable: Symbolic variable name (from emu_set_symbolic_*).
+    """
+    try:
+        engine = sessions.get(session_id)
+        r = engine.value_range(variable)
+        if "error" in r:
+            return f"Error: {r['error']}"
+        uniq = " (unique)" if r["unique"] else ""
+        return (f"{variable} ({r['bits']}-bit): min=0x{r['min']:x} ({r['min']}), "
+                f"max=0x{r['max']:x} ({r['max']}){uniq}")
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Value range error: {e}"
+
+
+@mcp.tool()
+def emu_hook_function(session_id: str, address: str, return_value: str | None = None) -> str:
+    """Replace a function with a stub that returns at once ('sim_procedures', angr).
+
+    Stub out a function (checksum, libc call, ...) so exploration skips its body.
+
+    session_id: Active angr session.
+    address: Hex address of the function to replace.
+    return_value: Force this concrete return (decimal/hex); omit for an
+      unconstrained symbolic return.
+
+    Returns a hook ID; remove it with emu_remove_hook.
+    """
+    try:
+        engine = sessions.get(session_id)
+        rv = _parse_int(return_value) if return_value is not None else None
+        hook_id = engine.hook_function(_parse_addr(address), return_value=rv)
+        tail = f"returning {return_value}" if return_value is not None else "returning unconstrained"
+        return f"Hooked function at {address} ({tail}). Hook ID: {hook_id}"
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Hook function error: {e}"
+
+
+@mcp.tool()
+def emu_hook_skip(session_id: str, address: str, length: int = 0) -> str:
+    """No-op bytes at an address so angr skips them ('sim_procedures', angr).
+
+    session_id: Active angr session.
+    address: Hex address to skip from.
+    length: Number of bytes to skip (0 replaces the block in place).
+
+    Returns a hook ID; remove it with emu_remove_hook.
+    """
+    try:
+        engine = sessions.get(session_id)
+        hook_id = engine.hook_skip(_parse_addr(address), length)
+        return f"Skip hook at {address} (+{length} bytes). Hook ID: {hook_id}"
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Hook skip error: {e}"
 
 
 # ===========================================================================

@@ -84,8 +84,20 @@ show which are active).
 - `emu_explore` drives execution toward a target address (and away from others),
   optionally with exploration techniques (`dfs`, `loopseer`, `lengthlimiter`) or
   Veritesting; `emu_solve` recovers the concrete inputs that get there
+- **Constraints & solver introspection** — `emu_constrain` narrows a symbolic
+  variable (`==, !=, <, <=, >, >=`) and `emu_value_range` reports its min/max and
+  whether it is now unique or over-constrained
+- **Function hooking / SimProcedures** — `emu_hook_function` replaces a function
+  with a stub that returns a fixed (or unconstrained) value, and `emu_hook_skip`
+  no-ops bytes, so exploration skips checksums/libc/irrelevant code
+- **Decompiler** — `emu_decompile` lifts a function to pseudo-C; `emu_function_info`
+  reports its flags (returning/PLT/syscall), block count, callers and callees
 - `emu_cfg` recovers a control-flow graph and lists functions; `emu_call_function`
   runs a function with concrete args (calling-convention aware) and returns the result
+- **Fine-grained event inspection** — `engine.add_inspect_hook(event, fn)` (via
+  `emu_eval`) fires a Python callback on any angr `state.inspect` event
+  (`mem_read`/`mem_write`/`reg_read`/`reg_write`/`instruction`/`call`/`return`/…) —
+  the bottom-level primitive for watchpoints, taint and custom analyses
 - Works on raw shellcode (shellcode mode) or whole binaries (binary mode)
 - Also supports the ordinary concrete workflow (run, step, read state, snapshots)
 
@@ -108,8 +120,12 @@ show which are active).
 | memory trace        |   ✓     |        |        |      |
 | snapshots           |   ✓     |   ✓    |   ✓    |  ✓   |
 | symbolic execution  |         |        |        |  ✓   |
+| constraints / solver|         |        |        |  ✓   |
 | CFG / functions     |         |        |        |  ✓   |
 | function calls      |         |        |        |  ✓   |
+| decompiler          |         |        |        |  ✓   |
+| function hooks      |         |        |        |  ✓   |
+| event inspection    |         |        |        |  ✓   |
 | memory management   |         |        |   ✓    |      |
 | breakpoints         |         |        |   ✓    |      |
 | register introspection |      |        |   ✓    |      |
@@ -174,7 +190,10 @@ Engine-specific tools:
 - `emu_list_engines` — discover installed engines and capabilities
 - `emu_hook_syscall`, `emu_hook_api` — Qiling only
 - `emu_set_symbolic_register`, `emu_set_symbolic_memory`, `emu_explore`, `emu_solve` — angr only
+- `emu_constrain`, `emu_value_range` — add solver constraints / query a variable's range (angr)
 - `emu_cfg`, `emu_call_function` — CFG/function listing and function execution (angr)
+- `emu_decompile`, `emu_function_info` — pseudo-C decompilation and function metadata (angr)
+- `emu_hook_function`, `emu_hook_skip` — replace/skip functions with SimProcedures (angr)
 - `emu_register_read_wide`, `emu_register_write_wide` — >64-bit registers (extended Icicle)
 - `emu_memory_unmap`, `emu_memory_protect` — runtime memory management (Icicle)
 - `emu_breakpoint_add`, `emu_breakpoint_remove` — execution breakpoints (Icicle)

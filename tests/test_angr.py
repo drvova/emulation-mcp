@@ -219,6 +219,152 @@ class TestAngrEngine(unittest.TestCase):
         eng.close()
 
 
+@unittest.skipUnless(HAS_ANGR, "angr package not installed")
+class TestAngrInspectHooks(unittest.TestCase):
+    def test_mem_write_inspect_fires_and_removes(self):
+        eng = AngrEngine(arch="x86_64")
+        self.assertIn("inspection", eng.CAPABILITIES)
+        seen = []
+        hid = eng.add_inspect_hook(
+            "mem_write",
+            lambda s: seen.append((
+                s.solver.eval(s.inspect.attrs.mem_write_address),
+                s.solver.eval(s.inspect.attrs.mem_write_expr))),
+            when="before")
+        eng.memory_write(0x8000000, b"\xde\xad\xbe\xef")
+        self.assertIn((0x8000000, 0xdeadbeef), seen)
+        self.assertTrue(eng.hook_remove(hid))
+        seen.clear()
+        eng.memory_write(0x8000000, b"\x11\x22\x33\x44")
+        self.assertEqual(seen, [])  # removed -> no more events
+        eng.close()
+
+    def test_bad_event_rejected(self):
+        eng = AngrEngine(arch="x86_64")
+        with self.assertRaises(ValueError):
+            eng.add_inspect_hook("not_an_event", lambda s: None)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ANGR, "angr package not installed")
+class TestAngrConstraints(unittest.TestCase):
+    def test_range_and_satisfiability(self):
+        eng = AngrEngine(arch="x86_64")
+        self.assertIn("constraints", eng.CAPABILITIES)
+        var = eng.set_symbolic_register("rdi")
+        self.assertTrue(eng.add_constraint(var, ">", 10)["satisfiable"])
+        self.assertTrue(eng.add_constraint(var, "<", 20)["satisfiable"])
+        r = eng.value_range(var)
+        self.assertEqual((r["min"], r["max"]), (11, 19))
+        self.assertTrue(eng.is_satisfiable())
+        # Over-constrain into unsatisfiability.
+        self.assertFalse(eng.add_constraint(var, ">", 100)["satisfiable"])
+        self.assertFalse(eng.is_satisfiable())
+        eng.close()
+
+    def test_unique_value(self):
+        eng = AngrEngine(arch="x86_64")
+        var = eng.set_symbolic_register("rsi")
+        eng.add_constraint(var, "==", 0x2a)
+        r = eng.value_range(var)
+        self.assertTrue(r["unique"])
+        self.assertEqual(r["min"], 0x2a)
+        eng.close()
+
+    def test_unknown_var_and_bad_op(self):
+        eng = AngrEngine(arch="x86_64")
+        with self.assertRaises(KeyError):
+            eng.add_constraint("nope", "==", 1)
+        var = eng.set_symbolic_register("rdi")
+        with self.assertRaises(ValueError):
+            eng.add_constraint(var, "<=>", 1)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ANGR, "angr package not installed")
+class TestAngrSimProcedures(unittest.TestCase):
+    # int add(int a,int b){return a+b;}  ->  lea eax,[rdi+rsi]; ret
+    _ADD = bytes.fromhex("8d0437" "c3")
+
+    def test_hook_function_forces_return(self):
+        eng = AngrEngine(arch="x86_64")
+        self.assertIn("sim_procedures", eng.CAPABILITIES)
+        eng.memory_write(CODE_BASE, self._ADD)
+        self.assertEqual(eng.call_function(CODE_BASE, [3, 4])["return_value"]["int"], 7)
+        hid = eng.hook_function(CODE_BASE, return_value=0x63)
+        self.assertEqual(eng.call_function(CODE_BASE, [3, 4])["return_value"]["int"], 0x63)
+        # Removing the hook restores the real implementation.
+        self.assertTrue(eng.hook_remove(hid))
+        self.assertEqual(eng.call_function(CODE_BASE, [3, 4])["return_value"]["int"], 7)
+        eng.close()
+
+    def test_hook_function_unconstrained(self):
+        eng = AngrEngine(arch="x86_64")
+        eng.memory_write(CODE_BASE, self._ADD)
+        hid = eng.hook_function(CODE_BASE, return_value=None)
+        # Must not raise; returns a (symbolic -> concretized) value.
+        res = eng.call_function(CODE_BASE, [3, 4])
+        self.assertNotIn("error", res, res)
+        self.assertTrue(eng.hook_remove(hid))
+        eng.close()
+
+    def test_hook_skip_install_remove(self):
+        eng = AngrEngine(arch="x86_64")
+        eng.memory_write(CODE_BASE, self._ADD)
+        hid = eng.hook_skip(CODE_BASE, 0)
+        self.assertEqual(len(eng.list_hooks()), 1)
+        self.assertTrue(eng.hook_remove(hid))
+        self.assertEqual(eng.list_hooks(), [])
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ANGR, "angr package not installed")
+class TestAngrDecompiler(unittest.TestCase):
+    def test_decompile_and_function_info_shellcode(self):
+        eng = AngrEngine(arch="x86_64")
+        self.assertIn("decompiler", eng.CAPABILITIES)
+        eng.memory_write(CODE_BASE, bytes.fromhex("8d0437" "c3"))  # add; ret
+        eng.recover_cfg(fast=True)
+        info = eng.function_info(CODE_BASE)
+        self.assertNotIn("error", info, info)
+        self.assertTrue(info["returning"])
+        self.assertGreaterEqual(info["size"], 1)
+        dec = eng.decompile_function(CODE_BASE)
+        self.assertNotIn("error", dec, dec)
+        self.assertIn("return", dec["code"])
+        eng.close()
+
+    def test_function_info_missing(self):
+        eng = AngrEngine(arch="x86_64")
+        eng.recover_cfg(fast=True)
+        res = eng.function_info(CODE_BASE + 0x3000)  # nothing recovered there
+        self.assertIn("error", res)
+        eng.close()
+
+    def test_callers_callees_on_binary(self):
+        import shutil, subprocess, tempfile
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        tmp = tempfile.mkdtemp()
+        src, out = os.path.join(tmp, "t.c"), os.path.join(tmp, "t")
+        with open(src, "w") as f:
+            f.write("int add(int a,int b){return a+b;}\n"
+                    "int main(int c,char**v){return add(c,7);}\n")
+        try:
+            subprocess.run(["gcc", "-static", "-O0", "-o", out, src],
+                           check=True, capture_output=True, timeout=60)
+        except Exception:
+            self.skipTest("could not build static binary")
+        eng = AngrEngine(binary_path=out)
+        cfg = eng.recover_cfg(fast=True)
+        byname = {f["name"]: int(f["address"], 16) for f in cfg["functions"]}
+        self.assertIn("add", byname)
+        self.assertIn("main", byname)
+        self.assertIn("add", eng.function_info(byname["main"])["callees"])
+        self.assertIn("main", eng.function_info(byname["add"])["callers"])
+        eng.close()
+
+
 if __name__ == "__main__":
     if not HAS_ANGR:
         print("angr not installed; skipping angr engine tests")
