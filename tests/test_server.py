@@ -5,6 +5,7 @@ Run standalone: python tests/test_server.py
 
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -281,6 +282,24 @@ class TestExtendedIcicleTools(unittest.TestCase):
             _fn(server.emu_run)(sid, "0x1000000", "0x100000b")
             out = _fn(server.emu_coverage)(sid, "get")
             self.assertIn("Covered basic blocks", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_background_gdb_non_blocking(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            caps = server.sessions.get(sid).CAPABILITIES
+            if "gdb" not in caps:
+                self.skipTest("binding has no GDB stub")
+            _fn(server.emu_memory_write)(sid, "0x1000000", "48c7c041000000")
+            t = time.time()
+            out = _fn(server.emu_gdb_serve)(sid, "127.0.0.1:54487",
+                                            timeout_secs=10, background=True)
+            # Must return promptly (not block for the serve duration).
+            self.assertLess(time.time() - t, 5.0)
+            self.assertIn("pid", out.lower())
+            stop = _fn(server.emu_gdb_stop)(sid)
+            self.assertIn("Stopped", stop)
         finally:
             _fn(server.emu_close_session)(sid)
 

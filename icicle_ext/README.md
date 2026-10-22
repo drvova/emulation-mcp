@@ -15,7 +15,7 @@ server can use it.
 | SLEIGH-native disassembly | `get_disasm`, `get_block_info` | `disassembly` (no capstone needed) |
 | Linux userspace emulation | `os="linux"`, `linux_load` | `os_emulation` (load an ELF, emulate syscalls) |
 | Block coverage | `enable_coverage`, `get_coverage`, `clear_coverage` | `coverage` |
-| GDB remote stub | `gdb_serve` | `gdb` (attach a real debugger) |
+| GDB remote stub | `gdb_serve` | `gdb` (attach a real debugger; server runs it non-blocking via a detached subprocess, see `gdb_server_runner.py`) |
 
 The stock wheel is still fully supported — the Python wrapper
 (`engines/icicle_engine.py`) feature-detects these methods and only advertises

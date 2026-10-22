@@ -56,9 +56,11 @@ much more of the framework, and the wrapper detects it automatically:
 - **Block coverage** — `emu_coverage` (enable / get / clear) records the basic
   blocks executed, for triage and fuzzing-style analysis.
 - **GDB remote stub** — `emu_gdb_serve` serves a GDB stub so you can attach a
-  real `gdb` (`target remote host:port`) to the emulated target. It blocks the
-  session for the debug session (the VM is single-threaded), so it's for
-  deliberate interactive debugging.
+  real `gdb` (`target remote host:port`). By default it runs the stub in a
+  **detached subprocess** seeded from a snapshot of the session, so the call
+  returns immediately and the MCP session stays responsive while you debug;
+  `emu_gdb_stop` ends it. Pass `background=false` for an in-process blocking
+  session (works for Linux-mode sessions too).
 
 The stock wheel remains fully supported — these features simply light up when
 the extended binding is present (`emu_list_engines` / a session's capabilities
@@ -157,7 +159,8 @@ Engine-specific tools:
 - `emu_step_back`, `emu_goto_icount` — reverse execution / time-travel (extended Icicle)
 - `emu_disassemble`, `emu_callstack` — native disassembly and call stack (extended Icicle)
 - `emu_coverage` — basic-block coverage enable/get/clear (extended Icicle)
-- `emu_gdb_serve` — serve a GDB remote stub to attach a real debugger (extended Icicle)
+- `emu_gdb_serve` / `emu_gdb_stop` — serve a GDB remote stub (non-blocking by
+  default) to attach a real debugger (extended Icicle)
 - `emu_fuzz` — coverage-guided fuzzing loop (any engine; see below)
 - `emu_compare_engines` — Unicorn vs. Icicle differential check
 

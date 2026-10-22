@@ -98,6 +98,47 @@ def _validate_binary_path(path: str) -> str:
 # EM-8: Opt-in gate for the arbitrary-code eval tool (off by default).
 ENABLE_EVAL = os.getenv("EMU_ENABLE_EVAL", "").lower() in ("1", "true", "yes", "on")
 
+# Background GDB subprocesses, keyed by session_id: (Popen, dump_file_path).
+_GDB_PROCS = {}
+_GDB_RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "icicle_ext", "gdb_server_runner.py")
+
+
+def _dump_icicle_state(engine) -> dict:
+    """Serialize an Icicle session's state for a fresh VM to restore.
+
+    Captures the icicle arch string, tracked memory regions (zero regions are
+    recorded without bytes), all <=64-bit registers, and pc/sp.
+    """
+    vm = engine.vm
+    regions = []
+    for base, (size, perms) in sorted(engine._regions.items()):
+        hexbytes = ""
+        try:
+            data = bytes(vm.mem_read(base, size))
+            if data.strip(b"\x00"):      # skip all-zero regions (mapped zeroed anyway)
+                hexbytes = data.hex()
+        except Exception:
+            pass
+        regions.append([base, size, perms, hexbytes])
+    regs = {}
+    try:
+        for name, (_off, rsize) in vm.reg_list().items():
+            if rsize <= 8:
+                try:
+                    regs[name] = vm.reg_read(name)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {
+        "arch": vm.architecture,
+        "regions": regions,
+        "regs": regs,
+        "pc": vm.pc,
+        "sp": vm.sp,
+    }
+
 # The underlying native object for each engine, reachable via target="native".
 _NATIVE_ATTR = {"unicorn": "uc", "qiling": "ql", "icicle": "vm", "angr": "state"}
 
@@ -675,6 +716,7 @@ def emu_close_session(session_id: str) -> str:
 
     session_id: The session ID returned by emu_create_session.
     """
+    _stop_gdb(session_id)  # tear down any background GDB server for this session
     if sessions.close(session_id):
         return f"Session {session_id} closed."
     return f"Session {session_id} not found."
@@ -1842,30 +1884,101 @@ def emu_fuzz(
 
 
 @mcp.tool()
-def emu_gdb_serve(session_id: str, address: str = "127.0.0.1:1234", timeout_secs: int = 30) -> str:
+def emu_gdb_serve(
+    session_id: str,
+    address: str = "127.0.0.1:1234",
+    timeout_secs: int = 120,
+    background: bool = True,
+) -> str:
     """Serve a GDB remote stub so a real debugger can attach ('gdb' capability).
 
-    Waits up to `timeout_secs` for one GDB client to connect to `address`, then
-    serves that debug session until the client detaches. Attach from another
-    terminal with:  gdb -ex "target remote <address>".
+    Attach from another terminal with:  gdb -ex "target remote <address>".
 
-    NOTE: this blocks the session for the duration of the debug session (the
-    emulated VM is single-threaded), so invoke it deliberately for interactive
-    debugging. It returns when the client detaches or the wait times out.
+    background=True (default): the stub runs in a DETACHED SUBPROCESS seeded from
+      a snapshot of the current session, and this call returns immediately — the
+      MCP session stays responsive. The subprocess waits up to `timeout_secs`
+      for a client, then serves until it detaches. Use emu_gdb_stop to end it.
+      (Icicle non-Linux sessions; the debugged target is a copy of the session.)
+    background=False: serve in-process (blocks this session until the client
+      detaches or the wait times out). Works for any Icicle session, incl. Linux.
 
     session_id: Active session ID.
     address: host:port to listen on (default 127.0.0.1:1234).
-    timeout_secs: How long to wait for a client to connect (default 30).
+    timeout_secs: How long to wait for a client to connect.
     """
     try:
         engine = sessions.get(session_id)
-        return engine.gdb_serve(address, timeout_secs)
+        if not engine.has_capability("gdb"):
+            return (f"Error: A GDB stub is not supported by the '{engine.engine_type}' engine "
+                    f"(needs the extended Icicle binding, icicle_ext/).")
+        if not background:
+            return engine.gdb_serve(address, timeout_secs)
+
+        # Non-blocking: dump state and serve from a detached subprocess.
+        if getattr(engine, "_linux", False):
+            return ("Error: background GDB does not support Linux-mode sessions "
+                    "(live kernel mappings aren't portable). Re-run with "
+                    "background=false for a blocking in-process session.")
+        if not os.path.exists(_GDB_RUNNER):
+            return f"Error: GDB runner script not found at {_GDB_RUNNER}."
+        _stop_gdb(session_id)  # replace any existing server for this session
+
+        import tempfile
+        import subprocess
+        state = _dump_icicle_state(engine)
+        fd, dump_path = tempfile.mkstemp(suffix=".json", prefix="emu_gdb_")
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        proc = subprocess.Popen(
+            [sys.executable, _GDB_RUNNER, dump_path, address, str(timeout_secs)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _GDB_PROCS[session_id] = (proc, dump_path)
+        return (
+            f"GDB server started in the background (pid {proc.pid}) on {address}, "
+            f"serving a snapshot of session {session_id}.\n"
+            f"Attach:  gdb -ex 'target remote {address}'\n"
+            f"It waits up to {timeout_secs}s for a client. Call emu_gdb_stop to end it."
+        )
     except NotImplementedError as e:
         return f"Error: {e}"
     except KeyError as e:
         return str(e)
     except Exception as e:
         return f"GDB serve error: {e}"
+
+
+def _stop_gdb(session_id: str) -> bool:
+    """Terminate a background GDB subprocess for a session, if any."""
+    entry = _GDB_PROCS.pop(session_id, None)
+    if entry is None:
+        return False
+    proc, dump_path = entry
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        os.remove(dump_path)
+    except OSError:
+        pass
+    return True
+
+
+@mcp.tool()
+def emu_gdb_stop(session_id: str) -> str:
+    """Stop a background GDB server started by emu_gdb_serve for this session.
+
+    session_id: Active session ID.
+    """
+    if _stop_gdb(session_id):
+        return f"Stopped the background GDB server for session {session_id}."
+    return f"No background GDB server running for session {session_id}."
 
 
 # ===========================================================================
