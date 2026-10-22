@@ -246,6 +246,10 @@ architecture. See the [Qiling documentation](https://docs.qiling.io/) for setup.
 
 ## Tools
 
+See [CAPABILITIES.md](CAPABILITIES.md) for the full reference: every tool grouped
+by category, the per-engine capability matrix, and which engine each tool
+targets.
+
 Session/exec/memory/register/hook/snapshot/trace tools are shared across engines
 (`emu_create_session`, `emu_run`, `emu_step`, `emu_memory_*`, `emu_registers_read`,
 `emu_register_write`, `emu_hook_address`, `emu_snapshot_*`, `emu_get_trace`, ...).
