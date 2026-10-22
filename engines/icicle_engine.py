@@ -241,12 +241,18 @@ class IcicleEngine(BaseEngine):
         self._has_callback_hooks = hasattr(self.vm, "add_py_block_hook")
         self._has_wide_regs = hasattr(self.vm, "reg_read_bytes")
         self._has_mem_hooks = hasattr(self.vm, "add_mem_write_hook")
+        self._has_pcode = hasattr(self.vm, "get_pcode")
+        self._has_mmio = hasattr(self.vm, "map_mmio")
 
         caps = set(type(self).CAPABILITIES)
         if self._has_callback_hooks:
             caps.add("callback_hooks")
         if self._has_mem_hooks:
             caps.add("memory_hooks")
+        if self._has_pcode:
+            caps.add("pcode_il")
+        if self._has_mmio:
+            caps.add("mmio")
         if self._has_wide_regs:
             caps.add("wide_registers")
         if self._has_reverse:
@@ -731,6 +737,37 @@ class IcicleEngine(BaseEngine):
             out.append({"address": f"0x{addr:x}", "instruction": text, "size": size})
             addr += size
         return out
+
+    def get_pcode(self, address: int) -> str:
+        """Lift the block at `address` to p-code IL text (instructions interleaved)."""
+        self._touch()
+        if not self._has_pcode:
+            raise NotImplementedError(
+                "P-code lifting requires the extended Icicle binding (icicle_ext/)."
+            )
+        text = self.vm.get_pcode(address)
+        if text is None:
+            raise ValueError(f"Could not lift p-code at 0x{address:x} (unmapped or undecodable).")
+        return text
+
+    # -- MMIO: regions serviced by Python callbacks (extended binding) --
+
+    def map_mmio(self, start: int, size: int, read_cb: Callable | None = None,
+                 write_cb: Callable | None = None) -> None:
+        """Map [start, start+size) as MMIO serviced by Python callbacks.
+
+        read_cb(addr, size) -> value (bytes or int, little-endian) supplies what
+        a read sees; write_cb(addr, data: bytes) observes writes. Either may be
+        None. The region has no RAM backing — it models device registers. The
+        callbacks are observe/serve-only and must not re-enter this engine.
+        """
+        self._touch()
+        if not self._has_mmio:
+            raise NotImplementedError(
+                "MMIO regions require the extended Icicle binding (icicle_ext/)."
+            )
+        if not self.vm.map_mmio(start, size, read_cb, write_cb):
+            raise RuntimeError(f"Failed to map MMIO region at 0x{start:x} (size=0x{size:x}).")
 
     # -- Linux userspace (extended binding) --
 

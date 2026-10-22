@@ -90,6 +90,8 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "sim_procedures": "Replace or skip functions with Python stubs (SimProcedures)",
     "callback_hooks": "Register Python callbacks that fire during emulation",
     "memory_hooks": "Register Python callbacks on guest memory reads/writes (watchpoints)",
+    "pcode_il": "Lift code to the engine's p-code intermediate language",
+    "mmio": "Map memory-mapped I/O regions serviced by Python callbacks",
     "filesystem": "Map host files/directories into the emulated filesystem",
     "io": "Feed the guest's stdin and capture its stdout/stderr",
     "wide_registers": "Read/write registers wider than 64 bits (vector/flag aggregates)",
@@ -229,6 +231,15 @@ class BaseEngine(ABC):
     def disassemble(self, address: int, count: int = 1) -> list[dict[str, Any]]:
         """Disassemble `count` instructions from `address`. 'disassembly' capability."""
         raise NotImplementedError(f"Native disassembly is not supported by the '{self.engine_type}' engine")
+
+    def get_pcode(self, address: int) -> str:
+        """Lift the block at `address` to p-code IL text. 'pcode_il' capability."""
+        raise NotImplementedError(f"P-code lifting is not supported by the '{self.engine_type}' engine")
+
+    def map_mmio(self, start: int, size: int, read_cb: Callable | None = None,
+                 write_cb: Callable | None = None) -> None:
+        """Map an MMIO region serviced by Python callbacks. 'mmio' capability."""
+        raise NotImplementedError(f"MMIO mapping is not supported by the '{self.engine_type}' engine")
 
     def enable_coverage(self) -> None:
         """Start recording executed basic blocks. 'coverage' capability."""

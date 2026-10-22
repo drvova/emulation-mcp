@@ -264,6 +264,49 @@ impl icicle_cpu::mem::ReadHook for PyReadHook {
     }
 }
 
+/// An MMIO region whose reads and writes are *serviced* by Python callbacks,
+/// not backed by RAM. On read, `read_cb(addr, size)` supplies the value (as
+/// `bytes` of length `size`, or an int written little-endian); on write,
+/// `write_cb(addr, data: bytes)` observes the store. A missing callback means
+/// reads return zero / writes are dropped. Callbacks must not re-enter the VM.
+struct PyIoHandler {
+    read_cb: Option<PyObject>,
+    write_cb: Option<PyObject>,
+}
+
+impl icicle_cpu::mem::IoMemory for PyIoHandler {
+    fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        if let Some(cb) = &self.read_cb {
+            Python::attach(|py| {
+                if let Ok(ret) = cb.bind(py).call1((addr, buf.len())) {
+                    if let Ok(bytes) = ret.extract::<Vec<u8>>() {
+                        let n = bytes.len().min(buf.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                    } else if let Ok(v) = ret.extract::<u64>() {
+                        let le = v.to_le_bytes();
+                        let n = le.len().min(buf.len());
+                        buf[..n].copy_from_slice(&le[..n]);
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, addr: u64, value: &[u8]) -> Result<(), MemError> {
+        if let Some(cb) = &self.write_cb {
+            Python::attach(|py| {
+                let data = pyo3::types::PyBytes::new(py, value);
+                let _ = cb.bind(py).call1((addr, data));
+            });
+        }
+        Ok(())
+    }
+}
+
 #[pyclass(unsendable, module = "icicle")]
 pub struct Icicle {
     architecture: String,
@@ -738,6 +781,23 @@ impl Icicle {
         self.vm.get_disasm(address).map(|s| s.to_string())
     }
 
+    /// Lifted P-code (the SLEIGH intermediate language) for the block group that
+    /// begins at `address`, rendered as text with the original instructions
+    /// interleaved. Returns None if the address cannot be lifted. This is the
+    /// semantic IR the emulator actually executes — the basis for taint,
+    /// symbolic reasoning, and semantic diffing.
+    pub fn get_pcode(&mut self, address: u64) -> Option<String> {
+        let group = self.vm.lift(address).ok()?;
+        group
+            .to_string_with_disasm(
+                &self.vm.code.blocks,
+                &self.vm.cpu.arch.sleigh,
+                false,
+                &self.vm.code.disasm,
+            )
+            .ok()
+    }
+
     /// (start, size) pairs for every currently mapped memory range. Works for
     /// any session (including OS-loaded images), unlike wrapper-side region
     /// tracking which only knows about explicitly mapped regions.
@@ -887,6 +947,27 @@ impl Icicle {
     /// Remove a read hook by the id returned from `add_mem_read_hook`.
     pub fn remove_mem_read_hook(&mut self, id: u32) -> bool {
         self.vm.cpu.mem.remove_read_hook(id)
+    }
+
+    // ---- MMIO: memory-mapped I/O serviced by Python callbacks ----
+
+    /// Map `[start, start+size)` as an MMIO region whose accesses are serviced
+    /// by Python, not backed by RAM. `read_cb(addr, size)` returns the value a
+    /// read sees (`bytes` of length `size`, or an int written little-endian);
+    /// `write_cb(addr, data: bytes)` is called on each write. Either callback
+    /// may be None (reads return zero / writes are dropped). Unlike a memory
+    /// watchpoint hook, the region has no storage — this models device
+    /// registers / peripherals. Returns True if the region was mapped.
+    #[pyo3(signature = (start, size, read_cb=None, write_cb=None))]
+    pub fn map_mmio(
+        &mut self,
+        start: u64,
+        size: u64,
+        read_cb: Option<PyObject>,
+        write_cb: Option<PyObject>,
+    ) -> bool {
+        let handler = self.vm.cpu.mem.register_io_handler(PyIoHandler { read_cb, write_cb });
+        self.vm.cpu.mem.map_memory_len(start, size, handler)
     }
 
     // ---- GDB remote stub ----

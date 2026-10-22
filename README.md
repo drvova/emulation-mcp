@@ -84,6 +84,13 @@ much more of the framework, and the wrapper detects it automatically:
   memory tracing. Remove with `engine.hook_remove(id)`.
 - **Wide registers** — `emu_register_read_wide` / `emu_register_write_wide`
   read/write registers wider than 64 bits (XMM/YMM/vector/flag aggregates).
+- **P-code IL** — `emu_pcode` lifts a block to the SLEIGH intermediate language
+  (the semantic IR the VM actually executes, instructions interleaved) — the
+  basis for taint, symbolic reasoning, and semantic diffing.
+- **MMIO regions** — `engine.map_mmio(start, size, read_cb, write_cb)` (via
+  `emu_eval`) maps memory-mapped I/O whose reads/writes are *serviced* by Python
+  callbacks rather than backed by RAM — device/peripheral registers, not just
+  observed like a watchpoint.
 - **GDB remote stub** — `emu_gdb_serve` serves a GDB stub so you can attach a
   real `gdb` (`target remote host:port`). By default it runs the stub in a
   **detached subprocess** seeded from a full snapshot of the session (all mapped
@@ -155,6 +162,8 @@ show which are active).
 | native disassembly  |         |   ✓    |  ✓ †   |      |
 | callback hooks      |         |   ✓    |  ✓ †   |      |
 | memory hooks        |         |   ✓    |  ✓ †   |      |
+| p-code IL           |         |        |  ✓ †   |      |
+| MMIO regions        |         |        |  ✓ †   |      |
 | filesystem mapping  |         |   ✓    |        |      |
 | stdin / stdout I/O  |         |   ✓    |        |      |
 | memory-map listing  |         |   ✓    |        |      |
@@ -250,6 +259,7 @@ Engine-specific tools:
 - `emu_list_registers` — full register-file introspection (Icicle, Qiling)
 - `emu_step_back`, `emu_goto_icount` — reverse execution / time-travel (extended Icicle)
 - `emu_disassemble` — native disassembly (extended Icicle, Qiling); `emu_callstack` — call stack (extended Icicle)
+- `emu_pcode` — lift a block to SLEIGH p-code IL (extended Icicle)
 - `emu_coverage` — basic-block coverage enable/get/clear (extended Icicle)
 - `emu_gdb_serve` / `emu_gdb_stop` — serve a GDB remote stub (non-blocking by
   default) to attach a real debugger (extended Icicle)

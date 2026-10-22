@@ -1870,6 +1870,31 @@ def emu_disassemble(session_id: str, address: str, count: int = 10) -> str:
 
 
 @mcp.tool()
+def emu_pcode(session_id: str, address: str) -> str:
+    """Lift a block to p-code IL ('pcode_il' capability, extended Icicle).
+
+    Returns the SLEIGH p-code — the intermediate language the emulator actually
+    executes — for the basic block at `address`, with the original instructions
+    interleaved. This is the semantic IR behind the disassembly, useful for
+    taint, symbolic reasoning, and semantic diffing.
+
+    session_id: Active session ID.
+    address: Hex address of the block.
+    """
+    try:
+        engine = sessions.get(session_id)
+        return engine.get_pcode(_parse_addr(address))
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except ValueError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"P-code error: {e}"
+
+
+@mcp.tool()
 def emu_memory_maps(session_id: str) -> str:
     """List the guest's mapped memory regions (Qiling).
 

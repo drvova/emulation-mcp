@@ -346,6 +346,44 @@ class TestExtendedIcicleTools(unittest.TestCase):
             _fn(server.emu_close_session)(sid)
             server.ENABLE_EVAL = orig
 
+    def test_pcode_via_server(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            if "pcode_il" not in server.sessions.get(sid).CAPABILITIES:
+                self.skipTest("binding lacks p-code lifting")
+            _fn(server.emu_memory_write)(sid, "0x1000000", "b80100000083c002")
+            out = _fn(server.emu_pcode)(sid, "0x1000000")
+            self.assertIn("MOV", out.upper())
+            self.assertIn("RAX", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_mmio_via_eval(self):
+        """MMIO regions are driveable through emu_eval (callbacks)."""
+        orig = server.ENABLE_EVAL
+        server.ENABLE_EVAL = True
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            if "mmio" not in server.sessions.get(sid).CAPABILITIES:
+                self.skipTest("binding lacks MMIO")
+            _fn(server.emu_memory_write)(sid, "0x1000000", "8b042500000040")  # mov eax,[0x40000000]
+            out = _fn(server.emu_eval)(sid,
+                "engine.map_mmio(0x40000000, 0x1000, read_cb=lambda a, s: 0x11223344)\n"
+                "engine.register_write('rip', 0x1000000)\n"
+                "engine.step(1)\n"
+                "result = hex(engine.register_read('rax'))")
+            self.assertIn("0x11223344", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+            server.ENABLE_EVAL = orig
+
+    def test_pcode_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_pcode)(sid, "0x1000000"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
     def test_coverage_via_server(self):
         sid = _new_session(engine="icicle", arch="x86_64")
         try:

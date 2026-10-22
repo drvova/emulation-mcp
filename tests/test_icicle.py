@@ -493,6 +493,64 @@ class TestIcicleMemoryHooks(unittest.TestCase):
         eng.close()
 
 
+@unittest.skipUnless(HAS_ICICLE and "pcode_il" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIciclePcode(unittest.TestCase):
+    def test_pcode_lift(self):
+        eng = IcicleEngine(arch="x86_64")
+        # mov eax, 1 ; add eax, 2
+        eng.memory_write(CODE_BASE, bytes.fromhex("b801000000" "83c002"))
+        text = eng.get_pcode(CODE_BASE)
+        # The IL carries the disassembly plus the micro-ops it expands to.
+        self.assertIn("MOV", text.upper())
+        self.assertIn("RAX", text)      # the p-code writes the full 64-bit reg
+        self.assertIn("ADD", text.upper())
+        eng.close()
+
+    def test_pcode_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("pcode_il", eng.CAPABILITIES)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "mmio" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleMmio(unittest.TestCase):
+    # disp32 with the high bit clear (0x40000000) so x86-64 does not
+    # sign-extend the displacement.
+    MMIO = 0x40000000
+
+    def test_mmio_read_and_write_serviced(self):
+        eng = IcicleEngine(arch="x86_64")
+        writes = []
+        eng.map_mmio(self.MMIO, 0x1000,
+                     read_cb=lambda a, s: 0x11223344,
+                     write_cb=lambda a, d: writes.append((a, bytes(d))))
+        # mov eax, [MMIO] ; mov [MMIO+4], eax
+        eng.memory_write(CODE_BASE, bytes.fromhex("8b042500000040" "89042504000040"))
+        eng.register_write("rip", CODE_BASE)
+        eng.step(1)
+        self.assertEqual(eng.register_read("rax"), 0x11223344)   # read serviced
+        eng.step(1)
+        self.assertEqual(writes, [(self.MMIO + 4, b"\x44\x33\x22\x11")])  # write serviced (LE)
+        eng.close()
+
+    def test_mmio_default_read_zero(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.map_mmio(self.MMIO, 0x1000)  # no callbacks
+        eng.register_write("rax", 0xdead)
+        eng.memory_write(CODE_BASE, bytes.fromhex("8b042500000040"))  # mov eax,[MMIO]
+        eng.register_write("rip", CODE_BASE)
+        eng.step(1)
+        self.assertEqual(eng.register_read("rax"), 0)  # unbacked read -> zero
+        eng.close()
+
+    def test_mmio_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("mmio", eng.CAPABILITIES)
+        eng.close()
+
+
 @unittest.skipUnless(HAS_ICICLE and "wide_registers" in EXT_CAPS,
                      "extended Icicle binding (icicle_ext/) not installed")
 class TestIcicleWideRegisters(unittest.TestCase):
