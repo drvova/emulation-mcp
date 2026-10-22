@@ -91,6 +91,76 @@ def _validate_binary_path(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reflective access helpers (emu_call / emu_describe / emu_eval)
+# ---------------------------------------------------------------------------
+
+# EM-8: Opt-in gate for the arbitrary-code eval tool (off by default).
+ENABLE_EVAL = os.getenv("EMU_ENABLE_EVAL", "").lower() in ("1", "true", "yes", "on")
+
+# The underlying native object for each engine, reachable via target="native".
+_NATIVE_ATTR = {"unicorn": "uc", "qiling": "ql", "icicle": "vm", "angr": "state"}
+
+
+def _native_object(engine):
+    """Return the engine's underlying native object (uc/ql/vm/state), or None."""
+    return getattr(engine, _NATIVE_ATTR.get(engine.engine_type, ""), None)
+
+
+def _resolve_target(engine, target: str):
+    """Resolve a reflective target name to an object."""
+    if target == "engine":
+        return engine
+    if target == "native":
+        obj = _native_object(engine)
+        if obj is None:
+            raise ValueError(f"Engine '{engine.engine_type}' exposes no native object.")
+        return obj
+    raise ValueError(f"Unknown target '{target}'. Use 'engine' or 'native'.")
+
+
+def _coerce_arg(v):
+    """Coerce JSON argument values into Python call arguments.
+
+    - "0x1234" (hex string) -> int
+    - {"hex": "deadbeef"}   -> bytes
+    - {"bytes": [1,2,3]}    -> bytes
+    - lists are coerced element-wise
+    """
+    if isinstance(v, str) and re.fullmatch(r"0[xX][0-9a-fA-F]+", v):
+        return int(v, 16)
+    if isinstance(v, dict):
+        if set(v) == {"hex"} and isinstance(v["hex"], str):
+            return bytes.fromhex(v["hex"].replace(" ", ""))
+        if set(v) == {"bytes"} and isinstance(v["bytes"], list):
+            return bytes(v["bytes"])
+        return v
+    if isinstance(v, list):
+        return [_coerce_arg(x) for x in v]
+    return v
+
+
+def _format_value(r) -> str:
+    """Render an arbitrary return value as a readable string."""
+    if r is None:
+        return "None"
+    if isinstance(r, bool):
+        return str(r)
+    if isinstance(r, int):
+        return f"{r} (0x{r:x})" if r >= 0 else str(r)
+    if isinstance(r, (bytes, bytearray)):
+        b = bytes(r)
+        return f"bytes[{len(b)}]: {b.hex()}"
+    if isinstance(r, (list, tuple)):
+        inner = ", ".join(_format_value(x) for x in list(r)[:64])
+        more = "" if len(r) <= 64 else f", … (+{len(r) - 64} more)"
+        return f"[{inner}{more}]"
+    if isinstance(r, dict):
+        items = ", ".join(f"{k}={_format_value(v)}" for k, v in list(r.items())[:64])
+        return f"{{{items}}}"
+    return repr(r)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -2139,6 +2209,154 @@ def emu_compare_engines(
         return "\n".join(lines)
     except Exception as e:
         return f"Comparison error: {e}"
+
+
+# ===========================================================================
+# Reflective access: reach the full engine surface (emu_call / emu_describe / emu_eval)
+# ===========================================================================
+
+@mcp.tool()
+def emu_describe(session_id: str, target: str = "native", filter: str = "") -> str:
+    """List the methods and attributes reachable on a session via emu_call.
+
+    This exposes the *entire* surface of an engine, not just the curated tools —
+    use it to discover what emu_call can invoke.
+
+    session_id: Active session ID.
+    target: "native" for the underlying emulator object (icicle VM, unicorn Uc,
+      qiling Ql, angr SimState), or "engine" for the wrapper (the emu_* methods).
+    filter: Optional case-insensitive substring to narrow the names.
+    """
+    try:
+        engine = sessions.get(session_id)
+        obj = _resolve_target(engine, target)
+        names = [n for n in dir(obj) if not n.startswith("_")]
+        if filter:
+            f = filter.lower()
+            names = [n for n in names if f in n.lower()]
+        methods, attrs = [], []
+        for n in sorted(names):
+            try:
+                member = getattr(obj, n)
+            except Exception:
+                attrs.append(n)
+                continue
+            if callable(member):
+                doc = (getattr(member, "__doc__", "") or "").strip().splitlines()
+                methods.append(f"  {n}(){'  — ' + doc[0] if doc else ''}")
+            else:
+                attrs.append(f"  {n} = {_format_value(member)}")
+        lines = [f"{engine.engine_type} session, target='{target}' "
+                 f"({type(obj).__module__}.{type(obj).__name__}):\n"]
+        lines.append(f"Methods ({len(methods)}):")
+        lines.extend(methods)
+        lines.append(f"\nAttributes ({len(attrs)}):")
+        lines.extend(attrs)
+        return "\n".join(lines)
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Describe error: {e}"
+
+
+@mcp.tool()
+def emu_call(
+    session_id: str,
+    method: str,
+    args: list | None = None,
+    kwargs: dict | None = None,
+    target: str = "native",
+) -> str:
+    """Invoke any method (or read any attribute) on a session's engine object.
+
+    This is the general escape hatch that reaches the full engine API without a
+    dedicated tool for each call. Use emu_describe to discover names.
+
+    session_id: Active session ID.
+    method: Name of the method or attribute (no leading underscore).
+    args: Positional arguments (JSON). Convenience coercions: a hex string like
+      "0x1000" becomes an int; {"hex": "deadbeef"} or {"bytes": [1,2,3]} becomes
+      bytes; lists are coerced element-wise.
+    kwargs: Keyword arguments (JSON, same coercions applied to values).
+    target: "native" (underlying emulator object, default) or "engine" (wrapper).
+
+    If `method` names a plain attribute, its value is returned. If it names a
+    method, it is called with the given args and the result is returned.
+    """
+    try:
+        engine = sessions.get(session_id)
+        obj = _resolve_target(engine, target)
+        if method.startswith("_"):
+            return "Error: access to private members (leading underscore) is not allowed."
+        if not hasattr(obj, method):
+            return (f"Error: '{method}' not found on target '{target}'. "
+                    f"Use emu_describe to list available names.")
+        member = getattr(obj, method)
+        if not callable(member):
+            return f"{method} = {_format_value(member)}"
+        call_args = [_coerce_arg(a) for a in (args or [])]
+        call_kwargs = {k: _coerce_arg(v) for k, v in (kwargs or {}).items()}
+        result = member(*call_args, **call_kwargs)
+        return f"{method}(...) -> {_format_value(result)}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Call error: {type(e).__name__}: {e}"
+
+
+@mcp.tool()
+def emu_eval(session_id: str, code: str) -> str:
+    """Run a Python snippet against a session (DISABLED unless opted in).
+
+    The snippet executes with `engine` (the wrapper), `native` (the underlying
+    emulator object), and `icicle`/`unicorn`/`qiling`/`angr` modules in scope.
+    Assign to `result` or end with an expression to return a value; anything
+    printed is captured.
+
+    This runs arbitrary Python in the server process and is therefore OFF by
+    default. Enable it only in a trusted, local setup by starting the server
+    with the environment variable EMU_ENABLE_EVAL=1.
+
+    session_id: Active session ID.
+    code: Python source to execute.
+    """
+    if not ENABLE_EVAL:
+        return ("Error: emu_eval is disabled. It runs arbitrary Python in the "
+                "server process. To enable it in a trusted local setup, restart "
+                "the server with EMU_ENABLE_EVAL=1.")
+    try:
+        engine = sessions.get(session_id)
+    except KeyError as e:
+        return str(e)
+    import io
+    import contextlib
+    ns = {
+        "engine": engine,
+        "native": _native_object(engine),
+        "result": None,
+    }
+    # Make the engine framework modules available if imported.
+    for mod in ("icicle", "unicorn", "qiling", "angr", "capstone"):
+        try:
+            ns[mod] = __import__(mod)
+        except Exception:
+            pass
+    buf = io.StringIO()
+    try:
+        compiled = compile(code, "<emu_eval>", "exec")
+        with contextlib.redirect_stdout(buf):
+            exec(compiled, ns)  # noqa: S102 — intentional, gated by EMU_ENABLE_EVAL
+        out = buf.getvalue()
+        result = ns.get("result")
+        parts = []
+        if out:
+            parts.append(f"stdout:\n{out.rstrip()}")
+        parts.append(f"result: {_format_value(result)}")
+        return "\n".join(parts)
+    except Exception as e:
+        out = buf.getvalue()
+        prefix = f"stdout:\n{out.rstrip()}\n" if out else ""
+        return f"{prefix}eval error: {type(e).__name__}: {e}"
 
 
 # ===========================================================================

@@ -150,6 +150,27 @@ Engine-specific tools:
 - `emu_disassemble`, `emu_callstack` — native disassembly and call stack (extended Icicle)
 - `emu_compare_engines` — Unicorn vs. Icicle differential check
 
+### Reaching the whole engine surface
+
+The curated tools cover the common workflow. For anything they don't, three
+reflective tools expose the *entire* engine API without a dedicated tool per
+call:
+
+- `emu_describe` — list every method/attribute reachable on a session, for the
+  underlying emulator object (`target="native"`: icicle VM, unicorn `Uc`,
+  qiling `Ql`, angr `SimState`) or the wrapper (`target="engine"`).
+- `emu_call` — invoke any of those methods (or read any attribute) by name.
+  Arguments are JSON with convenience coercions: `"0x1000"` → int,
+  `{"hex": "deadbeef"}` or `{"bytes": [...]}` → bytes. Private members are
+  blocked.
+- `emu_eval` — run a Python snippet against the session (`engine` and `native`
+  in scope). This executes arbitrary Python in the server process, so it is
+  **off by default**; enable it only in a trusted local setup by starting the
+  server with `EMU_ENABLE_EVAL=1`.
+
+Together these mean a capability that isn't yet a first-class tool is still
+reachable — call it directly, or script it with `emu_eval`.
+
 ## Architecture
 
 ```

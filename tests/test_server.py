@@ -137,6 +137,78 @@ def _icicle_is_extended():
 ICICLE_EXTENDED = _icicle_is_extended()
 
 
+class TestReflectiveTools(unittest.TestCase):
+    """The general 'reach everything' escape hatches."""
+
+    def test_describe_lists_native_methods(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            out = _fn(server.emu_describe)(sid, "native", "mem")
+            self.assertIn("mem_read", out)
+            self.assertIn("mem_write", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_call_reflective_memory(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            w = _fn(server.emu_call)(sid, "mem_write",
+                                     ["0x1000000", {"hex": "41424344"}], target="native")
+            self.assertIn("None", w)
+            r = _fn(server.emu_call)(sid, "mem_read", ["0x1000000", 4], target="native")
+            self.assertIn("41424344", r)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_call_engine_target(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            _fn(server.emu_call)(sid, "register_write", ["rax", "0x1234"], target="engine")
+            r = _fn(server.emu_call)(sid, "register_read", ["rax"], target="engine")
+            self.assertIn("0x1234", r)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_call_private_blocked(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            out = _fn(server.emu_call)(sid, "__class__", target="native")
+            self.assertIn("private", out.lower())
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_call_unknown_method(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            out = _fn(server.emu_call)(sid, "no_such_method_here", target="native")
+            self.assertIn("not found", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_eval_disabled_by_default(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            out = _fn(server.emu_eval)(sid, "result = 1 + 1")
+            self.assertIn("disabled", out.lower())
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_eval_when_enabled(self):
+        orig = server.ENABLE_EVAL
+        server.ENABLE_EVAL = True
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            out = _fn(server.emu_eval)(sid,
+                "engine.memory_write(0x1000000, bytes.fromhex('9090'))\n"
+                "print('ok')\n"
+                "result = engine.memory_read(0x1000000, 2).hex()")
+            self.assertIn("ok", out)
+            self.assertIn("9090", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+            server.ENABLE_EVAL = orig
+
+
 @unittest.skipUnless(ICICLE_EXTENDED, "extended Icicle binding (icicle_ext/) not installed")
 class TestExtendedIcicleTools(unittest.TestCase):
     def test_reverse_and_disasm_via_server(self):
