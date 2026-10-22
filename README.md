@@ -35,9 +35,28 @@ each can do.
   empty), full register-file introspection (`emu_list_registers` — all ~839
   x86-64 registers, offsets and sizes), and VM constructor knobs via
   `engine_options` (`jit`, `shadow_stack`, `track_uninitialized`, `mem_capacity`, …).
-  Note: the `icicle-emu` PyPI binding is itself a subset of the Icicle framework —
-  the fuzzing/Linux/GDB crates are not exposed to Python and would need a custom
-  build from source.
+
+#### Extended Icicle binding (`icicle_ext/`) — reaching the rest of the framework
+
+The PyPI `icicle-emu` wheel exposes only a slice of Icicle. Building the
+extended binding (`./icicle_ext/build.sh <python>`, needs Rust + maturin) unlocks
+much more of the framework, and the wrapper detects it automatically:
+
+- **Reverse execution & time-travel** — `emu_step_back`, `emu_goto_icount`
+  (rewind instructions or jump to any instruction count).
+- **Native VM snapshots** — complete register+memory snapshots (faster and more
+  complete than the per-region fallback).
+- **SLEIGH-native disassembly** — `emu_disassemble` straight from the emulator's
+  own semantics, no external disassembler.
+- **Call stack** — `emu_callstack`.
+- **Linux userspace emulation** — create a session with `engine_options={"os":
+  "linux"}` and a `binary_path`; the emulated kernel loads the ELF (argv/env)
+  and services syscalls, so you can run a whole Linux program, not just a
+  snippet. Static binaries work directly; see `icicle_ext/README.md`.
+
+The stock wheel remains fully supported — these features simply light up when
+the extended binding is present (`emu_list_engines` / a session's capabilities
+show which are active).
 
 ### angr — symbolic execution *(new)*
 - Make a register or region of memory **symbolic**, then explore every path
@@ -68,6 +87,12 @@ each can do.
 | memory management   |         |        |   ✓    |      |
 | breakpoints         |         |        |   ✓    |      |
 | register introspection |      |        |   ✓    |      |
+| reverse execution   |         |        |  ✓ †   |      |
+| native disassembly  |         |        |  ✓ †   |      |
+| call stack          |         |        |  ✓ †   |      |
+| Linux OS emulation  |         |   ✓    |  ✓ †   |      |
+
+† Icicle feature available with the extended binding (`icicle_ext/`); see below.
 
 ## Requirements
 
@@ -121,6 +146,8 @@ Engine-specific tools:
 - `emu_memory_unmap`, `emu_memory_protect` — runtime memory management (Icicle)
 - `emu_breakpoint_add`, `emu_breakpoint_remove` — execution breakpoints (Icicle)
 - `emu_list_registers` — full register-file introspection (Icicle)
+- `emu_step_back`, `emu_goto_icount` — reverse execution / time-travel (extended Icicle)
+- `emu_disassemble`, `emu_callstack` — native disassembly and call stack (extended Icicle)
 - `emu_compare_engines` — Unicorn vs. Icicle differential check
 
 ## Architecture
@@ -136,6 +163,9 @@ emulation/
     qiling_engine.py     # Qiling wrapper
     icicle_engine.py     # Icicle (SLEIGH) wrapper
     angr_engine.py       # angr symbolic/concrete wrapper
+  icicle_ext/            # Extended Icicle PyO3 binding (optional, built from source)
+    lib.rs               # Full-surface binding source
+    build.sh             # Clone-pinned, overlay, maturin build + install
   tests/
 ```
 

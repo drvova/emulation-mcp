@@ -197,6 +197,22 @@ class BaseEngine(ABC):
         """Enumerate all registers as {name: {offset, size}}. 'register_introspection'."""
         raise NotImplementedError(f"Register introspection is not supported by the '{self.engine_type}' engine")
 
+    def step_back(self, count: int = 1) -> dict[str, Any]:
+        """Reverse-execute `count` instructions. 'reverse_execution' capability."""
+        raise NotImplementedError(f"Reverse execution is not supported by the '{self.engine_type}' engine")
+
+    def goto_icount(self, target: int) -> dict[str, Any]:
+        """Time-travel to an absolute instruction count. 'reverse_execution' capability."""
+        raise NotImplementedError(f"Time-travel is not supported by the '{self.engine_type}' engine")
+
+    def get_callstack(self) -> list[int]:
+        """Return the current return-address call stack. 'callstack' capability."""
+        raise NotImplementedError(f"Call stack is not supported by the '{self.engine_type}' engine")
+
+    def disassemble(self, address: int, count: int = 1) -> list[dict[str, Any]]:
+        """Disassemble `count` instructions from `address`. 'disassembly' capability."""
+        raise NotImplementedError(f"Native disassembly is not supported by the '{self.engine_type}' engine")
+
     def hook_remove(self, hook_id: str) -> bool:
         """Remove a hook by ID. Returns True if removed."""
         if hook_id in self.hooks:

@@ -35,7 +35,9 @@ ENGINE_SPECS: dict[str, EngineSpec] = {
     "icicle": EngineSpec(
         "icicle", "icicle_engine", "IcicleEngine", "icicle", "icicle-emu",
         "CPU emulator built on Ghidra SLEIGH semantics. Adds RISC-V and PowerPC; "
-        "an independent implementation for cross-checking Unicorn results.",
+        "an independent implementation for cross-checking Unicorn results. With the "
+        "extended binding (icicle_ext/) it also gains reverse execution, native "
+        "snapshots, SLEIGH disassembly, call stacks and Linux userspace emulation.",
     ),
     "angr": EngineSpec(
         "angr", "angr_engine", "AngrEngine", "angr", "angr",

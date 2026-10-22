@@ -164,6 +164,11 @@ class IcicleEngine(BaseEngine):
         self,
         arch: str,
         *,
+        os: str = "none",
+        sysroot: str = "/",
+        binary_path: str = "",
+        argv: list[str] | None = None,
+        env: dict[str, str] | None = None,
         jit: bool = False,
         jit_mem: bool = True,
         shadow_stack: bool = False,
@@ -181,6 +186,8 @@ class IcicleEngine(BaseEngine):
             )
         super().__init__(arch, **kwargs)
         self.engine_type = "icicle"
+        self.ostype = os
+        self._linux = (os == "linux")
 
         vm_opts = dict(
             jit=jit, jit_mem=jit_mem, shadow_stack=shadow_stack,
@@ -192,7 +199,16 @@ class IcicleEngine(BaseEngine):
 
         icicle_arch = ARCH_MAP[arch]
         try:
-            self.vm = Icicle(icicle_arch, **vm_opts)
+            if self._linux:
+                # os=/sysroot= require the extended binding (see icicle_ext/).
+                self.vm = Icicle(icicle_arch, os="linux", sysroot=sysroot, **vm_opts)
+            else:
+                self.vm = Icicle(icicle_arch, **vm_opts)
+        except TypeError as e:
+            raise RuntimeError(
+                "Linux mode (os='linux') requires the extended Icicle binding. "
+                "Build it with icicle_ext/build.sh. Original error: " + str(e)
+            ) from e
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize Icicle for arch '{arch}' ({icicle_arch}): {e}"
@@ -213,13 +229,46 @@ class IcicleEngine(BaseEngine):
         # we need it for memory_search and snapshots.
         self._regions: dict[int, tuple[int, int]] = {}   # base -> (size, perms)
 
-        # Default layout mirrors the Unicorn engine so addresses are portable.
-        self.memory_map(CODE_BASE, CODE_SIZE, 7)
-        self.memory_map(STACK_BASE, STACK_SIZE, 6)
-        self.memory_map(HEAP_BASE, HEAP_SIZE, 7)
+        # Detect which features the installed binding provides (the PyPI wheel
+        # is a subset; icicle_ext/ rebuilds it with the full surface).
+        self._native_snapshot = hasattr(self.vm, "snapshot") and hasattr(self.vm, "restore")
+        self._has_reverse = hasattr(self.vm, "step_back") and hasattr(self.vm, "goto_icount")
+        self._has_callstack = hasattr(self.vm, "get_callstack")
+        self._has_native_disasm = hasattr(self.vm, "get_disasm")
+        self._has_linux = hasattr(self.vm, "linux_load")
 
-        self.vm.sp = STACK_TOP
+        caps = set(type(self).CAPABILITIES)
+        if self._has_reverse:
+            caps.add("reverse_execution")
+        if self._has_callstack:
+            caps.add("callstack")
+        if self._has_native_disasm:
+            caps.add("disassembly")
+        if self._linux:
+            caps.add("os_emulation")
+            caps.add("binary_loading")
+        # Instance-level capability set shadows the class attribute so
+        # has_capability()/get_info() report what this binding actually supports.
+        self.CAPABILITIES = frozenset(caps)
+
         self.stack_overflow_detected = False
+
+        if self._linux:
+            # The Linux loader maps the program image and stack itself; do not
+            # impose the shellcode layout.
+            if not self._has_linux:
+                raise RuntimeError(
+                    "Linux mode requires the extended Icicle binding (icicle_ext/)."
+                )
+            if binary_path:
+                self.linux_load(binary_path, argv or [], env or {})
+        else:
+            # Default layout mirrors the Unicorn engine so addresses are portable.
+            self.memory_map(CODE_BASE, CODE_SIZE, 7)
+            self.memory_map(STACK_BASE, STACK_SIZE, 6)
+            self.memory_map(HEAP_BASE, HEAP_SIZE, 7)
+            self.vm.sp = STACK_TOP
+
 
     # -- Internal helpers --
 
@@ -274,7 +323,17 @@ class IcicleEngine(BaseEngine):
     def start(self, begin: int, end: int = 0, timeout_ms: int = 10000) -> dict[str, Any]:
         self._touch()
         self.stack_overflow_detected = False
-        self.vm.pc = begin
+        # begin == 0 keeps the current pc (e.g. a Linux entry point set by the
+        # loader, or a resume after a breakpoint). CPU base addresses are never 0.
+        if begin:
+            self.vm.pc = begin
+        # Record a reverse-execution checkpoint on the actual timeline (correct
+        # pc) so step_back/goto_icount can rewind to this run's start.
+        if self._has_reverse:
+            try:
+                self.vm.save_snapshot()
+            except Exception:
+                pass
         # end == 0 means "free run" (until halt, breakpoint, crash or budget).
         target = end if end else None
 
@@ -536,25 +595,27 @@ class IcicleEngine(BaseEngine):
 
     def snapshot_save(self, label: str = "") -> str:
         self._touch()
-        regs = {}
-        for name in COMMON_REGS.get(self.arch, []):
-            try:
-                regs[name] = self.vm.reg_read(name)
-            except KeyError:
-                pass
-        mem = []
-        for base, (size, perms) in sorted(self._regions.items()):
-            try:
-                mem.append((base, size, perms, bytes(self.vm.mem_read(base, size))))
-            except MemoryException:
-                pass
-        data = {
-            "regs": regs,
-            "mem": mem,
-            "pc": self.vm.pc,
-            "sp": self.vm.sp,
-            "icount": self.vm.icount,
-        }
+        if self._native_snapshot:
+            # Full native snapshot (all registers + memory); far cheaper and
+            # more complete than the per-region copy fallback below.
+            data = {"native": self.vm.snapshot(), "regions": dict(self._regions)}
+        else:
+            regs = {}
+            for name in COMMON_REGS.get(self.arch, []):
+                try:
+                    regs[name] = self.vm.reg_read(name)
+                except KeyError:
+                    pass
+            mem = []
+            for base, (size, perms) in sorted(self._regions.items()):
+                try:
+                    mem.append((base, size, perms, bytes(self.vm.mem_read(base, size))))
+                except MemoryException:
+                    pass
+            data = {
+                "regs": regs, "mem": mem,
+                "pc": self.vm.pc, "sp": self.vm.sp, "icount": self.vm.icount,
+            }
         snap_id = self._gen_id("snap-")
         self.snapshots[snap_id] = SnapshotInfo(
             snapshot_id=snap_id,
@@ -570,6 +631,10 @@ class IcicleEngine(BaseEngine):
         if snap is None:
             raise KeyError(f"Snapshot '{snapshot_id}' not found. Available: {list(self.snapshots.keys())}")
         data = snap._data
+        if "native" in data:
+            self.vm.restore(data["native"])
+            self._regions = dict(data["regions"])
+            return
         # reset() clears memory and the (possibly stale) code cache; rebuilding
         # from the snapshot afterwards avoids self-modifying-code faults that a
         # plain overwrite of executed pages would raise.
@@ -587,6 +652,79 @@ class IcicleEngine(BaseEngine):
         self.vm.pc = data["pc"]
         self.vm.sp = data["sp"]
         self.vm.icount = data["icount"]
+
+    # -- Reverse execution & time-travel (extended binding) --
+
+    def step_back(self, count: int = 1) -> dict[str, Any]:
+        """Rewind `count` instructions and return the resulting state."""
+        self._touch()
+        if not self._has_reverse:
+            raise NotImplementedError(
+                "Reverse execution requires the extended Icicle binding (icicle_ext/)."
+            )
+        status = self.vm.step_back(count)
+        return {"status": str(status), "icount": self.vm.icount, "pc": f"0x{self.vm.pc:x}"}
+
+    def goto_icount(self, target: int) -> dict[str, Any]:
+        """Travel to an absolute instruction count (forwards or backwards)."""
+        self._touch()
+        if not self._has_reverse:
+            raise NotImplementedError(
+                "Time-travel requires the extended Icicle binding (icicle_ext/)."
+            )
+        status = self.vm.goto_icount(target)
+        return {"status": str(status), "icount": self.vm.icount, "pc": f"0x{self.vm.pc:x}"}
+
+    def save_reverse_checkpoint(self) -> None:
+        """Record an internal checkpoint for reverse execution at the current icount."""
+        if self._has_reverse:
+            self.vm.save_snapshot()
+
+    # -- Introspection (extended binding) --
+
+    def get_callstack(self) -> list[int]:
+        self._touch()
+        if not self._has_callstack:
+            raise NotImplementedError(
+                "Call stack requires the extended Icicle binding (icicle_ext/)."
+            )
+        return list(self.vm.get_callstack())
+
+    def disassemble(self, address: int, count: int = 1) -> list[dict[str, Any]]:
+        """Disassemble `count` instructions from `address` using SLEIGH
+        semantics (no external disassembler)."""
+        self._touch()
+        if not self._has_native_disasm:
+            raise NotImplementedError(
+                "Native disassembly requires the extended Icicle binding (icicle_ext/)."
+            )
+        out: list[dict[str, Any]] = []
+        addr = address
+        for _ in range(max(count, 1)):
+            text = self.vm.get_disasm(addr)
+            if text is None:
+                break
+            sizes = dict(self.vm.get_block_info(addr))
+            size = sizes.get(addr, 1) or 1
+            out.append({"address": f"0x{addr:x}", "instruction": text, "size": size})
+            addr += size
+        return out
+
+    # -- Linux userspace (extended binding) --
+
+    def linux_load(self, binary_path: str, argv: list[str] | None = None,
+                   env: dict[str, str] | None = None) -> None:
+        """Load an ELF into a Linux-mode VM with argv/env (os='linux')."""
+        self._touch()
+        if not self._has_linux:
+            raise NotImplementedError(
+                "Linux userspace emulation requires the extended Icicle binding (icicle_ext/)."
+            )
+        if not self._linux:
+            raise RuntimeError("This session was not created with os='linux'.")
+        env_pairs = list((env or {}).items())
+        self.vm.linux_load(binary_path, argv or [], env_pairs)
+        self.binary_path = binary_path
 
     # -- Lifecycle --
 

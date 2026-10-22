@@ -556,7 +556,15 @@ def emu_create_session(
         else:
             if not arch:
                 return f"Error: arch is required for the '{engine}' engine."
-            eng = engine_cls(arch=arch, **opts)
+            kw = dict(opts)
+            # Icicle Linux userspace mode: load an ELF with syscall emulation.
+            if engine == "icicle" and binary_path:
+                _validate_binary_path(binary_path)  # EM-1
+                kw["binary_path"] = binary_path
+                if args:
+                    kw["argv"] = args
+                kw.setdefault("os", "linux")
+            eng = engine_cls(arch=arch, **kw)
             if enable_trace:
                 eng.enable_tracing()
 
@@ -1541,6 +1549,112 @@ def emu_list_registers(session_id: str) -> str:
         return str(e)
     except Exception as e:
         return f"List registers error: {e}"
+
+
+# ===========================================================================
+# Reverse execution, introspection & Linux mode (extended Icicle binding)
+# ===========================================================================
+
+@mcp.tool()
+def emu_step_back(session_id: str, count: int = 1) -> str:
+    """Reverse-execute: rewind `count` instructions ('reverse_execution').
+
+    Requires the extended Icicle binding (icicle_ext/). The engine keeps a
+    checkpoint at the start of the session and re-derives the earlier state.
+
+    session_id: Active session ID.
+    count: Number of instructions to step backward (default 1).
+    """
+    try:
+        engine = sessions.get(session_id)
+        if count < 1:
+            return "Error: count must be at least 1."
+        result = engine.step_back(count)
+        return (f"Stepped back {count}. Now at icount={result['icount']}, pc={result['pc']} "
+                f"(status {result['status']}).")
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Step back error: {e}"
+
+
+@mcp.tool()
+def emu_goto_icount(session_id: str, target: int) -> str:
+    """Time-travel to an absolute instruction count ('reverse_execution').
+
+    Forwards or backwards; requires the extended Icicle binding.
+
+    session_id: Active session ID.
+    target: The instruction count to travel to.
+    """
+    try:
+        engine = sessions.get(session_id)
+        if target < 0:
+            return "Error: target must be non-negative."
+        result = engine.goto_icount(target)
+        return (f"At icount={result['icount']}, pc={result['pc']} (status {result['status']}).")
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Goto icount error: {e}"
+
+
+@mcp.tool()
+def emu_callstack(session_id: str) -> str:
+    """Show the current return-address call stack ('callstack' capability).
+
+    session_id: Active session ID.
+    """
+    try:
+        engine = sessions.get(session_id)
+        stack = engine.get_callstack()
+        if not stack:
+            return "Call stack is empty."
+        lines = [f"Call stack ({len(stack)} frames, innermost last):"]
+        for i, addr in enumerate(stack):
+            lines.append(f"  #{i}: 0x{addr:x}")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Callstack error: {e}"
+
+
+@mcp.tool()
+def emu_disassemble(session_id: str, address: str, count: int = 10) -> str:
+    """Disassemble instructions using the engine's native semantics.
+
+    Icicle ('disassembly' capability) uses SLEIGH directly, so no external
+    disassembler is required and the output matches what the emulator executes.
+
+    session_id: Active session ID.
+    address: Hex address to disassemble from.
+    count: Number of instructions (default 10).
+    """
+    try:
+        engine = sessions.get(session_id)
+        addr = _parse_addr(address)
+        if count < 1:
+            return "Error: count must be at least 1."
+        insns = engine.disassemble(addr, count)
+        if not insns:
+            return f"Could not disassemble at 0x{addr:x} (unmapped or undecodable)."
+        lines = [f"Disassembly at 0x{addr:x} ({len(insns)} instructions):"]
+        for i in insns:
+            lines.append(f"  {i['address']}: {i['instruction']}")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Disassemble error: {e}"
 
 
 # ===========================================================================

@@ -20,6 +20,17 @@ if HAS_ICICLE:
     from engines.icicle_engine import IcicleEngine, ARCH_MAP, COMMON_REGS
     from engines.base import CODE_BASE
 
+    def _detect_caps():
+        eng = IcicleEngine(arch="x86_64")
+        caps = set(eng.CAPABILITIES)
+        has_linux = eng._has_linux
+        eng.close()
+        return caps, has_linux
+
+    EXT_CAPS, HAS_LINUX_BINDING = _detect_caps()
+else:
+    EXT_CAPS, HAS_LINUX_BINDING = set(), False
+
 
 @unittest.skipUnless(HAS_ICICLE, "icicle package not installed")
 class TestIcicleEngine(unittest.TestCase):
@@ -311,6 +322,102 @@ class TestIcicleEngine(unittest.TestCase):
         eng.memory_write(CODE_BASE, b"\x48\xc7\xc0\x41\x00\x00\x00\x90")
         eng.start(CODE_BASE, CODE_BASE + 8)
         self.assertEqual(eng.register_read("rax"), 0x41)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "reverse_execution" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleReverseExecution(unittest.TestCase):
+    """Features that require the extended binding; skipped on the stock wheel."""
+
+    def _engine(self):
+        eng = IcicleEngine(arch="x86_64")
+        # mov rax,0x41 ; mov rbx,0x42 ; nop ; nop
+        eng.memory_write(CODE_BASE, bytes.fromhex("48c7c041000000" "48c7c342000000" "9090"))
+        return eng
+
+    def test_step_back(self):
+        eng = self._engine()
+        eng.start(CODE_BASE, CODE_BASE + 16)
+        self.assertEqual(eng.register_read("rax"), 0x41)
+        self.assertEqual(eng.register_read("rbx"), 0x42)
+        r = eng.step_back(2)
+        self.assertEqual(r["icount"], 2)
+        eng.close()
+
+    def test_goto_icount(self):
+        eng = self._engine()
+        eng.start(CODE_BASE, CODE_BASE + 16)
+        r = eng.goto_icount(1)
+        self.assertEqual(r["icount"], 1)
+        # Only the first instruction (mov rax) has executed.
+        self.assertEqual(eng.register_read("rax"), 0x41)
+        self.assertEqual(eng.register_read("rbx"), 0)
+        eng.close()
+
+    def test_native_snapshot_roundtrip(self):
+        eng = self._engine()
+        eng.start(CODE_BASE, CODE_BASE + 16)
+        snap = eng.snapshot_save("post")
+        self.assertIn("native", eng.snapshots[snap]._data)
+        eng.register_write("rax", 0x9999)
+        eng.snapshot_restore(snap)
+        self.assertEqual(eng.register_read("rax"), 0x41)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "disassembly" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleDisassembly(unittest.TestCase):
+    def test_disassemble(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.memory_write(CODE_BASE, bytes.fromhex("48c7c041000000" "48c7c342000000" "90"))
+        insns = eng.disassemble(CODE_BASE, 3)
+        self.assertEqual(len(insns), 3)
+        self.assertIn("mov", insns[0]["instruction"].lower())
+        self.assertIn("nop", insns[2]["instruction"].lower())
+        eng.close()
+
+    def test_callstack_available(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIsInstance(eng.get_callstack(), list)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and HAS_LINUX_BINDING,
+                     "extended Icicle binding with Linux support not installed")
+class TestIcicleLinux(unittest.TestCase):
+    """Full Linux userspace emulation: load a static ELF and run it."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil, subprocess, tempfile, os as _os
+        cls._bin = None
+        if shutil.which("gcc") is None:
+            return
+        cls._tmp = tempfile.mkdtemp()
+        src = _os.path.join(cls._tmp, "t.c")
+        out = _os.path.join(cls._tmp, "t")
+        with open(src, "w") as f:
+            f.write('int main(){return 7;}\n')
+        try:
+            subprocess.run(["gcc", "-static", "-O2", "-o", out, src],
+                           check=True, capture_output=True, timeout=60)
+            cls._bin = out
+        except Exception:
+            cls._bin = None
+
+    def test_load_and_run(self):
+        if not self._bin:
+            self.skipTest("could not compile a static test binary (gcc unavailable)")
+        eng = IcicleEngine(arch="x86_64", os="linux", binary_path=self._bin)
+        self.assertEqual(eng.ostype, "linux")
+        self.assertIn("os_emulation", eng.CAPABILITIES)
+        entry = eng.vm.pc
+        self.assertNotEqual(entry, 0)
+        result = eng.start(0, 0, timeout_ms=20000)  # free run to exit
+        self.assertIn(result["status"], ("ok", "timeout"))
+        self.assertGreater(result["instructions_executed"], 100)
         eng.close()
 
 

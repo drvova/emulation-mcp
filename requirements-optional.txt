@@ -6,6 +6,9 @@
 
 # Icicle -- CPU emulator built on Ghidra SLEIGH semantics.
 # Adds RISC-V, PowerPC, MSP430, ... and cross-checks Unicorn results.
+# The PyPI wheel exposes a subset of Icicle; for the full surface (reverse
+# execution, native snapshots, SLEIGH disassembly, call stacks, Linux userspace
+# emulation) build the extended binding instead: ./icicle_ext/build.sh
 icicle-emu>=0.0.11
 
 # angr -- symbolic execution (symbolic inputs, path exploration, constraint solving).

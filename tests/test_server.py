@@ -105,6 +105,55 @@ class TestUnicornThroughServer(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
+    def test_extended_tools_report_requirement_on_unicorn(self):
+        """Reverse-exec/disasm/callstack tools degrade cleanly on engines
+        without the capability (e.g. Unicorn, or stock Icicle)."""
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            for out in (
+                _fn(server.emu_step_back)(sid, 1),
+                _fn(server.emu_goto_icount)(sid, 0),
+                _fn(server.emu_callstack)(sid),
+                _fn(server.emu_disassemble)(sid, "0x1000000", 1),
+            ):
+                self.assertTrue(out.startswith("Error:"), out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+
+def _icicle_is_extended():
+    try:
+        import engines
+        if not engines.is_installed("icicle"):
+            return False
+        eng = engines.get_engine_class("icicle")(arch="x86_64")
+        ok = "reverse_execution" in eng.CAPABILITIES
+        eng.close()
+        return ok
+    except Exception:
+        return False
+
+
+ICICLE_EXTENDED = _icicle_is_extended()
+
+
+@unittest.skipUnless(ICICLE_EXTENDED, "extended Icicle binding (icicle_ext/) not installed")
+class TestExtendedIcicleTools(unittest.TestCase):
+    def test_reverse_and_disasm_via_server(self):
+        sid = _new_session(engine="icicle", arch="x86_64", enable_trace=True)
+        try:
+            _fn(server.emu_memory_write)(sid, "0x1000000",
+                                         "48c7c041000000" "48c7c342000000" "9090")
+            _fn(server.emu_run)(sid, "0x1000000", "0x1000010")
+            dis = _fn(server.emu_disassemble)(sid, "0x1000000", 2)
+            self.assertIn("MOV", dis.upper())
+            back = _fn(server.emu_step_back)(sid, 2)
+            self.assertIn("icount=2", back)
+            goto = _fn(server.emu_goto_icount)(sid, 1)
+            self.assertIn("icount=1", goto)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
 
 @unittest.skipUnless(HAS_ICICLE, "icicle not installed")
 class TestIcicleThroughServer(unittest.TestCase):
