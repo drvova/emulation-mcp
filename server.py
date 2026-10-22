@@ -25,6 +25,7 @@ from engines import (
     ENGINE_NAMES, get_engine_class, is_installed, describe_engines,
 )
 from engines.base import CODE_BASE, CODE_SIZE, DATA_BASE, DATA_SIZE, STACK_TOP
+import fuzzing
 
 mcp = FastMCP(
     "emulation",
@@ -1762,6 +1763,82 @@ def emu_coverage(session_id: str, action: str = "get") -> str:
         return str(e)
     except Exception as e:
         return f"Coverage error: {e}"
+
+
+@mcp.tool()
+def emu_fuzz(
+    session_id: str,
+    input_addr: str,
+    input_size: int,
+    run_start: str,
+    run_end: str = "",
+    seeds_hex: list[str] | None = None,
+    iterations: int = 1000,
+    timeout_ms: int = 1000,
+    wall_clock_s: float = 30.0,
+    seed: int | None = None,
+) -> str:
+    """Coverage-guided fuzz a code region by mutating an input in memory.
+
+    Each iteration restores a baseline snapshot, writes a mutated input to
+    `input_addr`, runs `run_start`..`run_end`, and keeps inputs that reach new
+    coverage. Inputs that fault are reported. Uses Icicle's block coverage when
+    available, otherwise the instruction trace as the coverage signal.
+
+    session_id: Active session ID (set up registers/memory and map input_addr first).
+    input_addr: Hex address where the fuzzed bytes are written (must be mapped).
+    input_size: Number of bytes of input.
+    run_start: Hex start address for each run.
+    run_end: Hex end address (empty => free run until halt/crash/budget).
+    seeds_hex: Optional initial corpus as hex strings.
+    iterations / wall_clock_s: stop after this many runs or this long.
+    timeout_ms: Per-run execution budget.
+    seed: Optional RNG seed for reproducibility.
+    """
+    try:
+        engine = sessions.get(session_id)
+        if input_size <= 0:
+            return "Error: input_size must be positive."
+        iaddr = _parse_addr(input_addr)
+        begin = _parse_addr(run_start) if run_start else 0
+        end = _parse_addr(run_end) if run_end else 0
+        seeds = []
+        for s in (seeds_hex or []):
+            clean = s.replace(" ", "")
+            if clean.lower().startswith("0x"):
+                clean = clean[2:]
+            seeds.append(bytes.fromhex(clean))
+        iterations = min(max(iterations, 1), MAX_STEPS)
+        result = fuzzing.run_fuzz(
+            engine, iaddr, input_size, begin, end,
+            seeds=seeds, iterations=iterations, timeout_ms=timeout_ms,
+            wall_clock_s=wall_clock_s, seed=seed,
+        )
+        if "error" in result:
+            return f"Error: {result['error']}"
+        lines = [
+            "### Fuzzing summary",
+            f"- Coverage signal: {result['mode']}",
+            f"- Executions: {result['executions']} in {result['elapsed_s']}s",
+            f"- Corpus size: {result['corpus_size']}",
+            f"- Coverage reached: {result['coverage']} "
+            f"{'blocks' if result['mode'] == 'blocks' else 'unique PCs'}",
+            f"- Inputs adding new coverage: {result['new_coverage_inputs']}",
+            f"- Unique crashes: {result['unique_crashes']}",
+        ]
+        if result["crashes"]:
+            lines.append("\n**Crashes:**")
+            for c in result["crashes"]:
+                lines.append(f"- input `{c['input']}` → {c['status']} "
+                             f"{('at ' + c['pc']) if c.get('pc') else ''} "
+                             f"{('— ' + str(c['error'])[:100]) if c.get('error') else ''}")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Fuzz error: {type(e).__name__}: {e}"
 
 
 @mcp.tool()

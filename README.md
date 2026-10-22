@@ -158,7 +158,19 @@ Engine-specific tools:
 - `emu_disassemble`, `emu_callstack` — native disassembly and call stack (extended Icicle)
 - `emu_coverage` — basic-block coverage enable/get/clear (extended Icicle)
 - `emu_gdb_serve` — serve a GDB remote stub to attach a real debugger (extended Icicle)
+- `emu_fuzz` — coverage-guided fuzzing loop (any engine; see below)
 - `emu_compare_engines` — Unicorn vs. Icicle differential check
+
+### Coverage-guided fuzzing
+
+`emu_fuzz` turns the primitives into a small coverage-guided fuzzer, no external
+framework: it snapshots a baseline, then repeatedly restores it, writes a
+mutated input to a chosen address, runs a code range, keeps inputs that reach
+new coverage, and reports inputs that fault. It uses Icicle's native block
+coverage when available (very fast) and falls back to the instruction trace on
+any engine that can trace, so it works on Unicorn too. Full-fidelity memory
+reset needs Icicle's native snapshots (Unicorn snapshots restore registers
+only).
 
 ### Reaching the whole engine surface
 

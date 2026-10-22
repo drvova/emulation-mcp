@@ -139,6 +139,50 @@ def _icicle_is_extended():
 ICICLE_EXTENDED = _icicle_is_extended()
 
 
+class TestFuzzing(unittest.TestCase):
+    """Coverage-guided fuzzing over the shared primitives (engine-agnostic)."""
+
+    # read byte at HEAP (0x8000000); if == 0x41 -> read [0] (crash) else skip
+    TARGET = ("48be0000000800000000"  # movabs rsi, 0x8000000
+              "8a06"                    # mov al, [rsi]
+              "3c41"                    # cmp al, 0x41
+              "7508"                    # jne +8 (skip)
+              "488b042500000000"        # mov rax, [0x0]  (crash: unmapped read)
+              "9090")                   # skip: nop; nop
+
+    def _engine(self):
+        # Prefer icicle (full-fidelity snapshots); fall back to unicorn.
+        return "icicle" if server.is_installed("icicle") else "unicorn"
+
+    def test_finds_crash_and_coverage(self):
+        sid = _new_session(engine=self._engine(), arch="x86_64")
+        try:
+            clen = len(self.TARGET) // 2
+            _fn(server.emu_memory_write)(sid, "0x1000000", self.TARGET)
+            out = _fn(server.emu_fuzz)(
+                sid, input_addr="0x8000000", input_size=1,
+                run_start="0x1000000", run_end=hex(0x1000000 + clen),
+                iterations=400, timeout_ms=500, wall_clock_s=20, seed=1234,
+            )
+            # The fuzzer must discover the branch and the crashing input (0x41).
+            self.assertIn("Unique crashes: 1", out, out)
+            self.assertIn("input `41`", out, out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_input_region_must_be_mapped(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            out = _fn(server.emu_fuzz)(
+                sid, input_addr="0xdead0000", input_size=4,
+                run_start="0x1000000", run_end="0x1000001",
+                iterations=5, seed=1,
+            )
+            self.assertTrue(out.startswith("Error:"), out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+
 class TestReflectiveTools(unittest.TestCase):
     """The general 'reach everything' escape hatches."""
 
