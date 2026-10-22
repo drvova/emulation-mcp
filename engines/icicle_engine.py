@@ -244,6 +244,7 @@ class IcicleEngine(BaseEngine):
         self._has_pcode = hasattr(self.vm, "get_pcode")
         self._has_mmio = hasattr(self.vm, "map_mmio")
         self._has_cmplog = hasattr(self.vm, "enable_cmplog")
+        self._has_symbols = hasattr(self.vm, "load_symbols")
 
         caps = set(type(self).CAPABILITIES)
         if self._has_callback_hooks:
@@ -256,6 +257,8 @@ class IcicleEngine(BaseEngine):
             caps.add("mmio")
         if self._has_cmplog:
             caps.add("cmplog")
+        if self._has_symbols:
+            caps.add("symbols")
         if self._has_wide_regs:
             caps.add("wide_registers")
         if self._has_reverse:
@@ -807,6 +810,59 @@ class IcicleEngine(BaseEngine):
         self._touch()
         if self._has_cmplog:
             self.vm.clear_cmplog()
+
+    # -- Symbolization (extended binding) --
+
+    def load_symbols(self, path: str, load_address: int = 0) -> int:
+        """Load an ELF's symbol table / DWARF so addresses can be symbolized.
+
+        load_address relocates PIE/dynamic objects; it is ignored for static /
+        non-PIE executables. Returns the number of symbols now known. May be
+        called repeatedly to merge symbols from several files.
+        """
+        self._touch()
+        if not self._has_symbols:
+            raise NotImplementedError(
+                "Symbolization requires the extended Icicle binding (icicle_ext/)."
+            )
+        return self.vm.load_symbols(path, load_address)
+
+    def symbolize(self, address: int) -> dict[str, Any] | None:
+        """Resolve an address to {name, offset, source?}, or None if unknown."""
+        self._touch()
+        if not self._has_symbols:
+            raise NotImplementedError(
+                "Symbolization requires the extended Icicle binding (icicle_ext/)."
+            )
+        res = self.vm.symbolize(address)
+        if res is None:
+            return None
+        name, offset = res
+        out: dict[str, Any] = {"name": name, "offset": offset,
+                               "address": f"0x{address:x}"}
+        src = self.vm.source_location(address)
+        if src:
+            out["source"] = src
+        return out
+
+    def lookup_symbol(self, name: str) -> int | None:
+        """Resolve a symbol name to its address, or None if unknown."""
+        self._touch()
+        if not self._has_symbols:
+            raise NotImplementedError(
+                "Symbolization requires the extended Icicle binding (icicle_ext/)."
+            )
+        return self.vm.lookup_symbol(name)
+
+    def list_symbols(self) -> list[dict[str, Any]]:
+        """List loaded symbols as {address, size, name, kind}."""
+        self._touch()
+        if not self._has_symbols:
+            raise NotImplementedError(
+                "Symbolization requires the extended Icicle binding (icicle_ext/)."
+            )
+        return [{"address": f"0x{addr:x}", "size": size, "name": name, "kind": kind}
+                for addr, size, name, kind in self.vm.list_symbols()]
 
     # -- Linux userspace (extended binding) --
 

@@ -1937,6 +1937,108 @@ def emu_cmplog(session_id: str, action: str = "get", instrument_calls: bool = Fa
 
 
 @mcp.tool()
+def emu_load_symbols(session_id: str, path: str, load_address: str = "0x0") -> str:
+    """Load an ELF's symbols for symbolization ('symbols', extended Icicle).
+
+    Reads the symbol table (and DWARF line info, if present) from the ELF at
+    `path` so addresses can be resolved to names and back. Call it for each
+    binary/library you want named.
+
+    session_id: Active session ID.
+    path: Host path to the ELF.
+    load_address: Relocation base for PIE/dynamic objects (ignored for static /
+      non-PIE). Hex or decimal.
+    """
+    try:
+        engine = sessions.get(session_id)
+        n = engine.load_symbols(path, _parse_addr(load_address))
+        return f"Loaded {n} symbols from {path}."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Load symbols error: {e}"
+
+
+@mcp.tool()
+def emu_symbolize(session_id: str, address: str) -> str:
+    """Resolve an address to a symbol ('symbols', extended Icicle).
+
+    Returns the covering symbol as `name+0xoffset` (and a DWARF source location
+    when available). Load symbols first with emu_load_symbols.
+
+    session_id: Active session ID.
+    address: Hex address to resolve.
+    """
+    try:
+        engine = sessions.get(session_id)
+        addr = _parse_addr(address)
+        res = engine.symbolize(addr)
+        if res is None:
+            return f"0x{addr:x}: no symbol (load symbols first, or address is unmapped)."
+        off = f"+0x{res['offset']:x}" if res["offset"] else ""
+        src = f"  [{res['source']}]" if res.get("source") else ""
+        return f"0x{addr:x}: {res['name']}{off}{src}"
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Symbolize error: {e}"
+
+
+@mcp.tool()
+def emu_lookup_symbol(session_id: str, name: str) -> str:
+    """Resolve a symbol name to its address ('symbols', extended Icicle).
+
+    session_id: Active session ID.
+    name: Symbol name (e.g. "main", "strcmp").
+    """
+    try:
+        engine = sessions.get(session_id)
+        addr = engine.lookup_symbol(name)
+        if addr is None:
+            return f"Symbol '{name}' not found (load symbols first)."
+        return f"{name} = 0x{addr:x}"
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Lookup symbol error: {e}"
+
+
+@mcp.tool()
+def emu_list_symbols(session_id: str, filter: str = "", limit: int = 100) -> str:
+    """List loaded symbols ('symbols', extended Icicle).
+
+    session_id: Active session ID.
+    filter: Case-insensitive substring to match symbol names (empty = all).
+    limit: Max symbols to list (default 100).
+    """
+    try:
+        engine = sessions.get(session_id)
+        syms = engine.list_symbols()
+        if filter:
+            f = filter.lower()
+            syms = [s for s in syms if f in s["name"].lower()]
+        syms.sort(key=lambda s: int(s["address"], 16))
+        lines = [f"Symbols ({len(syms)}" + (f" matching '{filter}'" if filter else "") + "):"]
+        for s in syms[:limit]:
+            lines.append(f"  {s['address']} {s['name']} (size {s['size']}, {s['kind']})")
+        if len(syms) > limit:
+            lines.append(f"  ... and {len(syms) - limit} more")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"List symbols error: {e}"
+
+
+@mcp.tool()
 def emu_memory_maps(session_id: str) -> str:
     """List the guest's mapped memory regions (Qiling).
 

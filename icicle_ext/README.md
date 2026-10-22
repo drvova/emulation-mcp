@@ -22,6 +22,7 @@ server can use it.
 | P-code IL | `get_pcode` | `pcode_il` — lift a block to the SLEIGH intermediate language (the IR the VM executes) |
 | MMIO regions | `map_mmio` | `mmio` — memory-mapped I/O serviced by Python callbacks (device/peripheral registers, no RAM backing) |
 | Compare logging | `enable_cmplog`, `get_cmplog`, `clear_cmplog` | `cmplog` — record compare operands (RedQueen / input-to-state) for magic-value/checksum solving |
+| Symbolization | `load_symbols`, `symbolize`, `lookup_symbol`, `list_symbols` | `symbols` — resolve addresses to names and back (ELF symbol table + DWARF) |
 | Wide registers | `reg_read_bytes`, `reg_write_bytes` | `wide_registers` — XMM/YMM/vector/flag aggregates |
 
 The stock wheel is still fully supported — the Python wrapper
@@ -76,6 +77,6 @@ for this server, not because they were missed:
   instrumentation *is* now exposed as `enable_cmplog`/`get_cmplog`.)
 
 Everything with a sensible Python surface — VM/CPU/MMU, snapshots, reverse
-execution, disassembly, p-code IL, call stack, coverage, compare logging, GDB,
-Linux userspace, MMIO, and the instruction/block/memory hooks — is reachable
-through the wrapper or `emu_eval`.
+execution, disassembly, p-code IL, call stack, coverage, compare logging,
+symbolization, GDB, Linux userspace, MMIO, and the instruction/block/memory
+hooks — is reachable through the wrapper or `emu_eval`.

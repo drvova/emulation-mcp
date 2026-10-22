@@ -589,6 +589,61 @@ class TestIcicleCmplog(unittest.TestCase):
         eng.close()
 
 
+@unittest.skipUnless(HAS_ICICLE and "symbols" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleSymbols(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import shutil, subprocess, tempfile
+        cls.bin = None
+        if shutil.which("gcc") is None:
+            return
+        d = tempfile.mkdtemp()
+        src, out = os.path.join(d, "s.c"), os.path.join(d, "s")
+        with open(src, "w") as f:
+            f.write("int my_secret_func(int a){return a*3+1;}\n"
+                    "int main(void){return my_secret_func(7);}\n")
+        try:
+            subprocess.run(["gcc", "-static", "-no-pie", "-g", "-O0", "-o", out, src],
+                           check=True, capture_output=True, timeout=60)
+            cls.bin = out
+        except Exception:
+            cls.bin = None
+
+    def setUp(self):
+        if self.bin is None:
+            self.skipTest("gcc unavailable / build failed")
+
+    def test_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("symbols", eng.CAPABILITIES)
+        eng.close()
+
+    def test_round_trip(self):
+        eng = IcicleEngine(arch="x86_64")
+        n = eng.load_symbols(self.bin, 0)
+        self.assertGreater(n, 0)
+        addr = eng.lookup_symbol("my_secret_func")
+        self.assertIsNotNone(addr)
+        sym = eng.symbolize(addr)
+        self.assertEqual(sym["name"], "my_secret_func")
+        self.assertEqual(sym["offset"], 0)
+        # Offset tracking: an address inside the function resolves with offset.
+        mid = eng.symbolize(addr + 4)
+        self.assertEqual(mid["name"], "my_secret_func")
+        self.assertEqual(mid["offset"], 4)
+        eng.close()
+
+    def test_list_and_missing(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.load_symbols(self.bin, 0)
+        names = {s["name"] for s in eng.list_symbols()}
+        self.assertIn("main", names)
+        self.assertIn("my_secret_func", names)
+        self.assertIsNone(eng.lookup_symbol("definitely_not_a_symbol"))
+        eng.close()
+
+
 @unittest.skipUnless(HAS_ICICLE and "wide_registers" in EXT_CAPS,
                      "extended Icicle binding (icicle_ext/) not installed")
 class TestIcicleWideRegisters(unittest.TestCase):

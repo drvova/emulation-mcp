@@ -407,6 +407,43 @@ class TestExtendedIcicleTools(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
+    def test_symbols_via_server(self):
+        import shutil, subprocess, tempfile
+        sid = _new_session(engine="icicle", arch="x86_64")
+        has = "symbols" in server.sessions.get(sid).CAPABILITIES
+        if not has:
+            _fn(server.emu_close_session)(sid)
+            self.skipTest("binding lacks symbolization")
+        if shutil.which("gcc") is None:
+            _fn(server.emu_close_session)(sid)
+            self.skipTest("gcc unavailable")
+        d = tempfile.mkdtemp()
+        src, out = os.path.join(d, "s.c"), os.path.join(d, "s")
+        with open(src, "w") as f:
+            f.write("int my_secret_func(int a){return a*3+1;}\nint main(void){return my_secret_func(7);}\n")
+        try:
+            subprocess.run(["gcc", "-static", "-no-pie", "-g", "-O0", "-o", out, src],
+                           check=True, capture_output=True, timeout=60)
+        except Exception:
+            _fn(server.emu_close_session)(sid)
+            self.skipTest("could not build symbol'd binary")
+        try:
+            self.assertIn("Loaded", _fn(server.emu_load_symbols)(sid, out))
+            lk = _fn(server.emu_lookup_symbol)(sid, "my_secret_func")
+            self.assertIn("my_secret_func = 0x", lk)
+            addr = lk.split("= ")[1]
+            self.assertIn("my_secret_func", _fn(server.emu_symbolize)(sid, addr))
+            self.assertIn("my_secret_func", _fn(server.emu_list_symbols)(sid, "secret"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_symbols_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_lookup_symbol)(sid, "main"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
     def test_coverage_via_server(self):
         sid = _new_session(engine="icicle", arch="x86_64")
         try:

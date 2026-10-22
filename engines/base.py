@@ -93,6 +93,7 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "pcode_il": "Lift code to the engine's p-code intermediate language",
     "mmio": "Map memory-mapped I/O regions serviced by Python callbacks",
     "cmplog": "Compare logging (RedQueen / input-to-state): record compare operands",
+    "symbols": "Resolve addresses to symbols and back (ELF symbol table + DWARF)",
     "filesystem": "Map host files/directories into the emulated filesystem",
     "io": "Feed the guest's stdin and capture its stdout/stderr",
     "wide_registers": "Read/write registers wider than 64 bits (vector/flag aggregates)",
@@ -253,6 +254,22 @@ class BaseEngine(ABC):
     def clear_cmplog(self) -> None:
         """Clear recorded compare operands (instrumentation stays). 'cmplog'."""
         raise NotImplementedError(f"Compare logging is not supported by the '{self.engine_type}' engine")
+
+    def load_symbols(self, path: str, load_address: int = 0) -> int:
+        """Load an ELF's symbol table / DWARF for symbolization. 'symbols'."""
+        raise NotImplementedError(f"Symbolization is not supported by the '{self.engine_type}' engine")
+
+    def symbolize(self, address: int) -> dict[str, Any] | None:
+        """Resolve an address to {name, offset, source?}. 'symbols' capability."""
+        raise NotImplementedError(f"Symbolization is not supported by the '{self.engine_type}' engine")
+
+    def lookup_symbol(self, name: str) -> int | None:
+        """Resolve a symbol name to its address. 'symbols' capability."""
+        raise NotImplementedError(f"Symbolization is not supported by the '{self.engine_type}' engine")
+
+    def list_symbols(self) -> list[dict[str, Any]]:
+        """List loaded symbols as {address, size, name, kind}. 'symbols'."""
+        raise NotImplementedError(f"Symbolization is not supported by the '{self.engine_type}' engine")
 
     def enable_coverage(self) -> None:
         """Start recording executed basic blocks. 'coverage' capability."""

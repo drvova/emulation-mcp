@@ -318,6 +318,8 @@ pub struct Icicle {
     coverage: Option<Rc<RefCell<HashSet<u64>>>>,
     // Compare-logging (RedQueen / input-to-state) instrumentation, when enabled.
     cmplog: Option<icicle_fuzzing::cmplog2::CmpLog2Ref>,
+    // Symbol table / DWARF debug info loaded from one or more ELF files.
+    debug_info: Option<icicle_cpu::debug_info::DebugInfo>,
 }
 
 /// Map a core VmExit to the Python-facing RunStatus enum.
@@ -533,6 +535,7 @@ impl Icicle {
             snapshots: Vec::new(),
             coverage: None,
             cmplog: None,
+            debug_info: None,
         })
     }
 
@@ -799,6 +802,54 @@ impl Icicle {
                 &self.vm.code.disasm,
             )
             .ok()
+    }
+
+    // ---- Symbolization (ELF symbol table + DWARF) ----
+
+    /// Load the symbol table and DWARF line info from the ELF at `path`,
+    /// relocated by `load_address` (ignored for non-PIE/static executables).
+    /// Can be called more than once to merge symbols from several files.
+    /// Returns the number of symbols now known.
+    pub fn load_symbols(&mut self, path: String, load_address: u64) -> PyResult<usize> {
+        let data = std::fs::read(&path)
+            .map_err(|e| PyException::new_err(format!("Failed to read {path}: {e}")))?;
+        let mut info = self.debug_info.take().unwrap_or_default();
+        info.add_file(&data, load_address)
+            .map_err(|e| PyException::new_err(format!("Failed to load symbols: {e}")))?;
+        let count = info.symbols_iter().count();
+        self.debug_info = Some(info);
+        Ok(count)
+    }
+
+    /// Resolve an address to `(symbol_name, offset_from_symbol_start)`, or None
+    /// if no loaded symbol covers it. Requires `load_symbols` first.
+    pub fn symbolize(&self, addr: u64) -> Option<(String, u64)> {
+        let info = self.debug_info.as_ref()?;
+        let (name, start, _kind) = info.symbols.resolve_addr(addr)?;
+        Some((name.to_string(), addr - start))
+    }
+
+    /// Resolve a symbol name to its address, or None if unknown.
+    pub fn lookup_symbol(&self, name: &str) -> Option<u64> {
+        self.debug_info.as_ref()?.symbols.resolve_sym(name)
+    }
+
+    /// Every loaded symbol as `(address, size, name, kind)`.
+    pub fn list_symbols(&self) -> Vec<(u64, u64, String, String)> {
+        let mut out = Vec::new();
+        if let Some(info) = &self.debug_info {
+            for (addr, len, name, kind) in info.symbols_iter() {
+                out.push((addr, len, name.to_string(), format!("{kind:?}")));
+            }
+        }
+        out
+    }
+
+    /// Source location (`function` or `symbol+offset`, from DWARF when present)
+    /// for an address, or None. Requires `load_symbols` on a binary built with
+    /// debug info for file/line detail.
+    pub fn source_location(&self, addr: u64) -> Option<String> {
+        self.debug_info.as_ref()?.symbolize_addr(addr).and_then(|loc| loc.label())
     }
 
     /// (start, size) pairs for every currently mapped memory range. Works for
