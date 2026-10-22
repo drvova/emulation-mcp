@@ -49,9 +49,38 @@ class TraceEntry:
 
 MAX_TRACE_ENTRIES = 100_000
 
+# Default memory layout shared by the CPU-level engines (unicorn, icicle, angr)
+# so that addresses are interchangeable between them.
+CODE_BASE = 0x1000000
+CODE_SIZE = 4 * 1024 * 1024      # 4 MB
+STACK_BASE = 0x7000000
+STACK_SIZE = 1 * 1024 * 1024     # 1 MB
+STACK_TOP = STACK_BASE + STACK_SIZE  # 0x7100000
+HEAP_BASE = 0x8000000
+HEAP_SIZE = 2 * 1024 * 1024      # 2 MB
+DATA_BASE = 0x2000000
+DATA_SIZE = 2 * 1024 * 1024      # 2 MB - for user data (strings, buffers)
+
+# Capability flags an engine can advertise via BaseEngine.CAPABILITIES.
+CAPABILITY_DESCRIPTIONS: dict[str, str] = {
+    "shellcode": "Run raw code bytes in a blank address space",
+    "binary_loading": "Load ELF/PE binaries",
+    "os_emulation": "Emulate OS services (syscalls, libraries, filesystem)",
+    "address_hooks": "Hook execution of a specific address",
+    "syscall_hooks": "Hook syscalls by name",
+    "api_hooks": "Hook library API calls by name",
+    "instruction_trace": "Record every executed instruction",
+    "memory_trace": "Record memory reads and writes",
+    "snapshots": "Save and restore emulation state",
+    "symbolic": "Symbolic execution: symbolic inputs, path exploration, constraint solving",
+}
+
 
 class BaseEngine(ABC):
     """Abstract base for all emulation engines."""
+
+    # Subset of CAPABILITY_DESCRIPTIONS keys supported by the engine.
+    CAPABILITIES: frozenset[str] = frozenset()
 
     def __init__(self, arch: str, **kwargs: Any):
         self.arch = arch
@@ -70,6 +99,9 @@ class BaseEngine(ABC):
 
     def _gen_id(self, prefix: str = "") -> str:
         return f"{prefix}{uuid.uuid4().hex[:8]}"
+
+    def has_capability(self, capability: str) -> bool:
+        return capability in self.CAPABILITIES
 
     # -- Execution --
 
@@ -133,6 +165,14 @@ class BaseEngine(ABC):
     def hook_address(self, address: int, callback: Callable | None = None) -> str:
         """Install a hook at a specific address. Returns hook_id."""
         ...
+
+    def hook_syscall(self, name: str, callback: Callable | None = None) -> str:
+        """Hook a syscall by name. Only engines with the 'syscall_hooks' capability."""
+        raise NotImplementedError(f"Syscall hooks are not supported by the '{self.engine_type}' engine")
+
+    def hook_api(self, func_name: str, callback: Callable | None = None) -> str:
+        """Hook a library API by name. Only engines with the 'api_hooks' capability."""
+        raise NotImplementedError(f"API hooks are not supported by the '{self.engine_type}' engine")
 
     def hook_remove(self, hook_id: str) -> bool:
         """Remove a hook by ID. Returns True if removed."""
@@ -224,4 +264,5 @@ class BaseEngine(ABC):
             "snapshots": len(self.snapshots),
             "trace_entries": len(self.trace),
             "tracing_enabled": self.tracing_enabled,
+            "capabilities": sorted(self.CAPABILITIES),
         }

@@ -21,22 +21,28 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastmcp import FastMCP
 from session_manager import SessionManager
-from engines.unicorn_engine import UnicornEngine, CODE_BASE, CODE_SIZE, DATA_BASE, DATA_SIZE, STACK_TOP
-from engines.qiling_engine import QilingEngine
+from engines import (
+    ENGINE_NAMES, get_engine_class, is_installed, describe_engines,
+)
+from engines.base import CODE_BASE, CODE_SIZE, DATA_BASE, DATA_SIZE, STACK_TOP
 
 mcp = FastMCP(
     "emulation",
     instructions=(
         "CPU and binary emulation for reverse engineering workflows.\n"
-        "Two engines available:\n"
+        "Engines (call emu_list_engines to see which are installed):\n"
         "- 'unicorn': Fast CPU emulator for shellcode and code snippets. No OS, no syscalls.\n"
-        "- 'qiling': Full binary emulation with OS support (Linux/Windows). Needs rootfs for shared libs.\n\n"
+        "- 'qiling':  Full binary emulation with OS support (Linux/Windows/...). Needs a rootfs.\n"
+        "- 'icicle':  CPU emulator on Ghidra SLEIGH semantics. Adds RISC-V/PowerPC/MSP430 and\n"
+        "             serves as an independent cross-check of Unicorn (see emu_compare_engines).\n"
+        "- 'angr':    Symbolic execution. Make registers/memory symbolic and solve for the\n"
+        "             inputs that drive execution to a target address (emu_explore/emu_solve).\n\n"
         "Typical workflow:\n"
-        "1. Create a session with emu_create_session\n"
-        "2. For Unicorn: map memory, write code, run\n"
+        "1. Create a session with emu_create_session (pick an engine + arch)\n"
+        "2. For CPU engines: map memory, write code, run\n"
         "3. For Qiling: point at binary + rootfs, hook syscalls/APIs, run\n"
-        "4. Inspect registers, memory, trace\n"
-        "5. Use snapshots to save/restore state for exploration"
+        "4. For angr: write code, make inputs symbolic, emu_explore to a target, emu_solve\n"
+        "5. Inspect registers, memory, trace; use snapshots to save/restore state"
     ),
 )
 
@@ -484,7 +490,7 @@ def _format_report_trace(trace_entries: list[dict], arch: str) -> str:
 @mcp.tool()
 def emu_create_session(
     engine: str,
-    arch: str,
+    arch: str = "",
     label: str = "",
     binary_path: str = "",
     rootfs: str = "",
@@ -494,15 +500,22 @@ def emu_create_session(
 ) -> str:
     """Create a new emulation session.
 
-    engine: "unicorn" for shellcode/snippet emulation, "qiling" for full binary emulation.
-    arch: Architecture string - "x86", "x86_64", "arm", "arm_thumb", "arm64", "mips", "mips_le".
+    engine: one of "unicorn", "qiling", "icicle", "angr" (see emu_list_engines).
+      - unicorn / icicle: CPU emulators for shellcode & code snippets.
+      - qiling: full binary emulation with OS services.
+      - angr: symbolic execution (shellcode mode, or binary mode with binary_path).
+    arch: Architecture string - "x86", "x86_64", "arm", "arm_thumb", "arm64", "mips",
+      "mips_le", and (icicle/angr) "riscv64", "ppc", "ppc64", etc. Optional for angr in
+      binary mode (detected from the binary).
     label: Optional human-readable label for the session.
 
-    For Qiling only:
+    For Qiling:
       binary_path: Path to the ELF/PE binary to emulate.
       rootfs: Path to the root filesystem (e.g., extracted firmware squashfs-root).
       ostype: "linux", "windows", or "freebsd".
       args: Command-line arguments for the binary.
+    For angr binary mode:
+      binary_path: Path to the ELF/PE binary (no rootfs needed).
 
     Returns session_id to use with other emu_* tools.
     """
@@ -511,28 +524,36 @@ def emu_create_session(
         if len(sessions.list_sessions()) >= MAX_SESSIONS:
             return f"Error: Maximum session limit ({MAX_SESSIONS}) reached. Close existing sessions first."
 
-        if engine == "unicorn":
-            eng = UnicornEngine(arch=arch)
-            if enable_trace:
-                eng.enable_tracing()
-        elif engine == "qiling":
+        if engine not in ENGINE_NAMES:
+            return f"Error: Unknown engine '{engine}'. Available: {', '.join(ENGINE_NAMES)}."
+        if not is_installed(engine):
+            return (f"Error: Engine '{engine}' is not installed. "
+                    f"See emu_list_engines for installation instructions.")
+        engine_cls = get_engine_class(engine)
+
+        if engine == "qiling":
             if not binary_path:
                 return "Error: binary_path is required for Qiling engine."
             if not rootfs:
                 return "Error: rootfs is required for Qiling engine (path to extracted filesystem)."
-            # EM-1: Validate binary path
-            _validate_binary_path(binary_path)
-            eng = QilingEngine(
-                binary_path=binary_path,
-                rootfs=rootfs,
-                arch=arch,
-                ostype=ostype,
-                args=args or [],
-                enable_trace=enable_trace,
+            _validate_binary_path(binary_path)  # EM-1
+            eng = engine_cls(
+                binary_path=binary_path, rootfs=rootfs, arch=arch,
+                ostype=ostype, args=args or [], enable_trace=enable_trace,
             )
+        elif engine == "angr" and binary_path:
+            _validate_binary_path(binary_path)  # EM-1
+            eng = engine_cls(arch=arch, binary_path=binary_path)
+            if enable_trace:
+                eng.enable_tracing()
         else:
-            return f"Error: Unknown engine '{engine}'. Use 'unicorn' or 'qiling'."
+            if not arch:
+                return f"Error: arch is required for the '{engine}' engine."
+            eng = engine_cls(arch=arch)
+            if enable_trace:
+                eng.enable_tracing()
 
+        arch = eng.arch  # may have been detected (angr binary mode)
         session_id = sessions.create_session(eng, label=label or f"{engine}/{arch}")
         info = eng.get_info()
         return (
@@ -604,7 +625,7 @@ def emu_run(
         end = _parse_addr(end_addr) if end_addr else 0
 
         # EM-6: Enforce wall-clock timeout for Qiling sessions via threading.Timer
-        if isinstance(engine, QilingEngine):
+        if engine.engine_type == "qiling":
             _timeout_fired = threading.Event()
 
             def _on_timeout():
@@ -680,6 +701,7 @@ def emu_emulate_shellcode(
     base_address: str = "0x1000000",
     timeout_ms: int = 5000,
     format: str = "default",
+    engine: str = "unicorn",
 ) -> str:
     """One-shot shellcode emulation. Creates a temporary session, runs the code, returns results.
 
@@ -688,12 +710,17 @@ def emu_emulate_shellcode(
     base_address: Address to load shellcode at (default: 0x1000000).
     timeout_ms: Maximum execution time (default: 5000ms).
     format: Output format - "default" for plain text, "report" for markdown tables.
+    engine: CPU engine to use - "unicorn" (default), "icicle", or "angr".
 
     Returns: disassembly trace, final register state, and any memory changes.
     """
     if format not in ("default", "report"):
         return f"Error: Unknown format '{format}'. Use 'default' or 'report'."
-    engine = None
+    if engine not in ("unicorn", "icicle", "angr"):
+        return f"Error: engine must be 'unicorn', 'icicle' or 'angr' for shellcode emulation, not '{engine}'."
+    if not is_installed(engine):
+        return f"Error: Engine '{engine}' is not installed. See emu_list_engines."
+    engine_obj = None
     try:
         clean_hex = code_hex.replace(" ", "")
         if clean_hex.lower().startswith("0x"):
@@ -701,7 +728,8 @@ def emu_emulate_shellcode(
         code = bytes.fromhex(clean_hex)
         base = _parse_addr(base_address)
 
-        engine = UnicornEngine(arch=arch)
+        engine_obj = get_engine_class(engine)(arch=arch)
+        engine = engine_obj  # the rest of this function operates on the instance
         engine.enable_tracing()
 
         # Write code to default code segment
@@ -733,9 +761,9 @@ def emu_emulate_shellcode(
         return f"Shellcode emulation error: {e}"
     finally:
         # EM-7: Ensure engine cleanup even on exception
-        if engine is not None:
+        if engine_obj is not None:
             try:
-                engine.close()
+                engine_obj.close()
             except Exception:
                 pass
 
@@ -824,8 +852,9 @@ def emu_load_function(
     stub_imports: bool = True,
     enable_trace: bool = True,
     label: str = "",
+    engine: str = "unicorn",
 ) -> str:
-    """Load a function from a binary into a ready-to-run Unicorn emulation session.
+    """Load a function from a binary into a ready-to-run CPU emulation session.
 
     binary_path: Path to ELF/PE binary.
     function_address: Hex address of the function (e.g. "0xaf188"). Uses radare2 addresses.
@@ -835,9 +864,14 @@ def emu_load_function(
     stub_imports: If True, detect external calls (PLT/GOT) and stub them with ret-0.
     enable_trace: If True, enable instruction tracing from the start.
     label: Optional session label.
+    engine: CPU engine for the session - "unicorn" (default) or "icicle".
 
     Returns session_id and setup summary. Use emu_run() with the returned addresses to execute.
     """
+    if engine not in ("unicorn", "icicle"):
+        return f"Error: emu_load_function supports 'unicorn' or 'icicle', not '{engine}'."
+    if not is_installed(engine):
+        return f"Error: Engine '{engine}' is not installed. See emu_list_engines."
     try:
         # EM-1: Validate binary path (raises ValueError if disallowed)
         _validate_binary_path(binary_path)
@@ -936,7 +970,7 @@ def emu_load_function(
         # ---------------------------------------------------------------
         # 2. Create Unicorn session
         # ---------------------------------------------------------------
-        engine = UnicornEngine(arch=emu_arch)
+        engine = get_engine_class(engine)(arch=emu_arch)
         if enable_trace:
             engine.enable_tracing()
 
@@ -1291,8 +1325,8 @@ def emu_hook_syscall(session_id: str, syscall_name: str, description: str = "") 
     """
     try:
         engine = sessions.get(session_id)
-        if not isinstance(engine, QilingEngine):
-            return "Error: Syscall hooks are only available for Qiling sessions."
+        if not engine.has_capability("syscall_hooks"):
+            return f"Error: Syscall hooks are not supported by the '{engine.engine_type}' engine (Qiling only)."
         hook_id = engine.hook_syscall(syscall_name)
         if description:
             engine.hooks[hook_id].description = description
@@ -1315,8 +1349,8 @@ def emu_hook_api(session_id: str, api_name: str, description: str = "") -> str:
     """
     try:
         engine = sessions.get(session_id)
-        if not isinstance(engine, QilingEngine):
-            return "Error: API hooks are only available for Qiling sessions."
+        if not engine.has_capability("api_hooks"):
+            return f"Error: API hooks are not supported by the '{engine.engine_type}' engine (Qiling only)."
         hook_id = engine.hook_api(api_name)
         if description:
             engine.hooks[hook_id].description = description
@@ -1605,6 +1639,257 @@ def emu_export_evidence(
         return str(e)
     except Exception as e:
         return f"Export error: {e}"
+
+
+# ===========================================================================
+# Engine discovery
+# ===========================================================================
+
+@mcp.tool()
+def emu_list_engines() -> str:
+    """List the available emulation engines, their install status and capabilities.
+
+    Use this to discover which engines are usable in this environment and what
+    each one can do (shellcode, OS emulation, symbolic execution, ...).
+    """
+    lines = ["Emulation engines:\n"]
+    for info in describe_engines():
+        status = "installed" if info["installed"] else "NOT installed"
+        lines.append(f"### {info['name']}  [{status}]")
+        lines.append(f"{info['description']}")
+        if info["installed"]:
+            lines.append(f"- Capabilities: {', '.join(info['capabilities'])}")
+            if info["architectures"]:
+                lines.append(f"- Architectures: {', '.join(info['architectures'])}")
+        else:
+            lines.append(f"- Install with: pip install {info['pip_package']}")
+            if info.get("error"):
+                lines.append(f"- Detail: {info['error']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# Symbolic execution (angr)
+# ===========================================================================
+
+def _require_symbolic(engine) -> str:
+    if not engine.has_capability("symbolic"):
+        return (f"Error: Symbolic execution is not supported by the '{engine.engine_type}' engine. "
+                f"Create an 'angr' session.")
+    return ""
+
+
+@mcp.tool()
+def emu_set_symbolic_register(session_id: str, name: str, bits: int = 0) -> str:
+    """Make a register symbolic (angr sessions only).
+
+    session_id: Active angr session.
+    name: Register name (e.g. "rdi", "r0", "a0").
+    bits: Width in bits; defaults to the register's natural width.
+
+    Returns the symbolic variable name to use with emu_solve.
+    """
+    try:
+        engine = sessions.get(session_id)
+        err = _require_symbolic(engine)
+        if err:
+            return err
+        var = engine.set_symbolic_register(name, bits)
+        return f"Register {name} is now symbolic. Variable: {var}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Symbolic register error: {e}"
+
+
+@mcp.tool()
+def emu_set_symbolic_memory(session_id: str, address: str, size: int, label: str = "") -> str:
+    """Make a region of memory symbolic (angr sessions only).
+
+    session_id: Active angr session.
+    address: Hex address (e.g. "0x8000000").
+    size: Number of bytes to make symbolic.
+    label: Optional label used in the variable name.
+
+    Returns the symbolic variable name to use with emu_solve.
+    """
+    try:
+        engine = sessions.get(session_id)
+        err = _require_symbolic(engine)
+        if err:
+            return err
+        if size <= 0:
+            return "Error: size must be greater than 0."
+        addr = _parse_addr(address)
+        var = engine.set_symbolic_memory(addr, size, label)
+        return f"{size} bytes at 0x{addr:x} are now symbolic. Variable: {var}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Symbolic memory error: {e}"
+
+
+@mcp.tool()
+def emu_explore(
+    session_id: str,
+    find: list[str],
+    avoid: list[str] | None = None,
+    timeout_ms: int = 30000,
+    num_find: int = 1,
+) -> str:
+    """Symbolically explore paths to a target address (angr sessions only).
+
+    session_id: Active angr session.
+    find: One or more hex addresses to reach (e.g. ["0x1000011"]).
+    avoid: Optional hex addresses to avoid.
+    timeout_ms: Wall-clock budget for the search (default 30000).
+    num_find: Number of distinct solutions to collect (default 1).
+
+    Returns the solved values for every symbolic variable on each found path.
+    """
+    try:
+        engine = sessions.get(session_id)
+        err = _require_symbolic(engine)
+        if err:
+            return err
+        if not find:
+            return "Error: at least one 'find' address is required."
+        find_addrs = [_parse_addr(a) for a in find]
+        avoid_addrs = [_parse_addr(a) for a in (avoid or [])]
+        result = engine.explore(find_addrs, avoid_addrs, timeout_ms=timeout_ms, num_find=num_find)
+
+        lines = [f"Exploration: {result['status']}"]
+        lines.append(f"  found={result.get('found', 0)} avoided={result.get('avoided', 0)} "
+                     f"deadended={result.get('deadended', 0)} "
+                     f"active_remaining={result.get('active_remaining', 0)} "
+                     f"elapsed={result.get('elapsed_ms', 0)} ms")
+        for i, sol in enumerate(result.get("solutions", [])):
+            lines.append(f"\nSolution #{i} (reached {sol['address']}):")
+            if not sol["values"]:
+                lines.append("  (no symbolic variables defined)")
+            for var, v in sol["values"].items():
+                if v is None:
+                    lines.append(f"  {var}: <unsolvable>")
+                else:
+                    lines.append(f"  {var}: {v['hex']} ({v['int']})  bytes={v['bytes']}")
+        if result["status"] != "found":
+            lines.append("\nNo path reached the target. Try different find/avoid addresses, "
+                         "a longer timeout, or check that inputs are symbolic.")
+        return "\n".join(lines)
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Explore error: {e}"
+
+
+@mcp.tool()
+def emu_solve(session_id: str, variable: str, count: int = 1) -> str:
+    """Solve for concrete values of a symbolic variable (angr sessions only).
+
+    session_id: Active angr session.
+    variable: The symbolic variable name returned by emu_set_symbolic_*.
+    count: Maximum number of distinct solutions to return (default 1).
+
+    Uses the most recent exploration result if one exists, else the current state.
+    """
+    try:
+        engine = sessions.get(session_id)
+        err = _require_symbolic(engine)
+        if err:
+            return err
+        if count <= 0:
+            return "Error: count must be greater than 0."
+        sols = engine.solve(variable, count)
+        if not sols:
+            return f"No solutions found for '{variable}' (constraints may be unsatisfiable)."
+        lines = [f"Solutions for {variable} ({len(sols)}):"]
+        for v in sols:
+            lines.append(f"  0x{v:x} ({v})")
+        return "\n".join(lines)
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Solve error: {e}"
+
+
+# ===========================================================================
+# Cross-engine comparison
+# ===========================================================================
+
+@mcp.tool()
+def emu_compare_engines(
+    arch: str,
+    code_hex: str,
+    engines: list[str] | None = None,
+    base_address: str = "0x1000000",
+    timeout_ms: int = 5000,
+) -> str:
+    """Run the same shellcode on two CPU engines and diff the final register state.
+
+    Useful as an independent check: if Unicorn and Icicle disagree on a result,
+    one of them is likely mis-emulating the code.
+
+    arch: Architecture ("x86", "x86_64", "arm", "mips", ...).
+    code_hex: Hex-encoded shellcode bytes.
+    engines: Which engines to compare (default ["unicorn", "icicle"]).
+    base_address: Load address (default 0x1000000).
+    timeout_ms: Per-engine execution budget.
+
+    Returns each engine's status and a table of registers that differ.
+    """
+    engines = engines or ["unicorn", "icicle"]
+    if len(engines) < 2:
+        return "Error: provide at least two engines to compare."
+    for name in engines:
+        if name not in ("unicorn", "icicle"):
+            return f"Error: emu_compare_engines supports 'unicorn' and 'icicle', not '{name}'."
+        if not is_installed(name):
+            return f"Error: Engine '{name}' is not installed. See emu_list_engines."
+    try:
+        clean_hex = code_hex.replace(" ", "")
+        if clean_hex.lower().startswith("0x"):
+            clean_hex = clean_hex[2:]
+        code = bytes.fromhex(clean_hex)
+        base = _parse_addr(base_address)
+
+        results: dict[str, dict] = {}
+        reg_states: dict[str, dict] = {}
+        for name in engines:
+            eng = get_engine_class(name)(arch=arch)
+            try:
+                eng.memory_write(base, code)
+                results[name] = eng.start(base, base + len(code), timeout_ms=timeout_ms)
+                reg_states[name] = eng.registers_read_all()
+            finally:
+                eng.close()
+
+        lines = [f"Cross-engine comparison ({arch}, {len(code)} bytes):\n"]
+        lines.append("| Engine | Status |")
+        lines.append("|--------|--------|")
+        for name in engines:
+            lines.append(f"| {name} | {results[name].get('status', '?')} |")
+
+        # Diff registers common to all engines.
+        common = set.intersection(*(set(reg_states[n]) for n in engines))
+        diffs = []
+        for reg in sorted(common):
+            vals = {n: reg_states[n][reg] for n in engines}
+            if len(set(vals.values())) > 1:
+                diffs.append((reg, vals))
+
+        lines.append("")
+        if not diffs:
+            lines.append(f"✓ All {len(common)} common registers agree across {', '.join(engines)}.")
+        else:
+            lines.append(f"✗ {len(diffs)} register(s) differ:")
+            lines.append("| Register | " + " | ".join(engines) + " |")
+            lines.append("|----------|" + "|".join(["-------"] * len(engines)) + "|")
+            for reg, vals in diffs:
+                lines.append(f"| {reg} | " + " | ".join(f"0x{vals[n]:x}" for n in engines) + " |")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Comparison error: {e}"
 
 
 # ===========================================================================

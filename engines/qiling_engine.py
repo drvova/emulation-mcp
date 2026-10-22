@@ -88,6 +88,11 @@ def resolve_os(ostype: str) -> QL_OS:
 class QilingEngine(BaseEngine):
     """Qiling Framework wrapper for full binary emulation."""
 
+    CAPABILITIES = frozenset({
+        "binary_loading", "os_emulation", "address_hooks", "syscall_hooks", "api_hooks", "snapshots",
+    })
+    SUPPORTED_ARCHS = tuple(ARCH_MAP)
+
     def __init__(
         self,
         binary_path: str,

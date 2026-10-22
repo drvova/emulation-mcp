@@ -1,0 +1,241 @@
+"""Tests for the Icicle engine wrapper.
+
+Run standalone: python tests/test_icicle.py
+Skipped entirely if the `icicle` package is not installed.
+"""
+
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+try:
+    import icicle  # noqa: F401
+    HAS_ICICLE = True
+except ImportError:
+    HAS_ICICLE = False
+
+if HAS_ICICLE:
+    from engines.icicle_engine import IcicleEngine, ARCH_MAP, COMMON_REGS
+    from engines.base import CODE_BASE
+
+
+@unittest.skipUnless(HAS_ICICLE, "icicle package not installed")
+class TestIcicleEngine(unittest.TestCase):
+    def test_create_engine(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertEqual(eng.arch, "x86_64")
+        self.assertEqual(eng.engine_type, "icicle")
+        info = eng.get_info()
+        self.assertEqual(info["engine_type"], "icicle")
+        self.assertIn("shellcode", info["capabilities"])
+        eng.close()
+
+    def test_invalid_arch(self):
+        with self.assertRaises(ValueError):
+            IcicleEngine(arch="pdp11")
+
+    def test_memory_read_write(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.memory_write(CODE_BASE, b"\x41\x42\x43\x44")
+        self.assertEqual(eng.memory_read(CODE_BASE, 4), b"\x41\x42\x43\x44")
+        eng.memory_write(CODE_BASE + 0x100, b"\xde\xad\xbe\xef")
+        self.assertEqual(eng.memory_read(CODE_BASE + 0x100, 4), b"\xde\xad\xbe\xef")
+        eng.close()
+
+    def test_register_read_write(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.register_write("rax", 0x1234)
+        self.assertEqual(eng.register_read("rax"), 0x1234)
+        eng.register_write("rbx", 0xDEADBEEF)
+        self.assertEqual(eng.register_read("rbx"), 0xDEADBEEF)
+        eng.close()
+
+    def test_registers_read_all(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.register_write("rax", 0xAAAA)
+        regs = eng.registers_read_all()
+        self.assertIn("rax", regs)
+        self.assertIn("rsp", regs)
+        self.assertEqual(regs["rax"], 0xAAAA)
+        eng.close()
+
+    def test_invalid_register(self):
+        eng = IcicleEngine(arch="x86_64")
+        with self.assertRaises(ValueError):
+            eng.register_read("nonexistent_reg")
+        eng.close()
+
+    def test_execute_shellcode_native(self):
+        """Run without tracing (native run_until path)."""
+        eng = IcicleEngine(arch="x86_64")
+        code = (
+            b"\x48\xc7\xc0\x41\x00\x00\x00"  # mov rax, 0x41
+            b"\x48\xc7\xc3\x42\x00\x00\x00"  # mov rbx, 0x42
+            b"\x90\x90"                        # nop; nop
+        )
+        eng.memory_write(CODE_BASE, code)
+        result = eng.start(CODE_BASE, CODE_BASE + len(code))
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(eng.register_read("rax"), 0x41)
+        self.assertEqual(eng.register_read("rbx"), 0x42)
+        eng.close()
+
+    def test_execute_shellcode_traced(self):
+        """Run with tracing (step loop path) and verify the trace."""
+        eng = IcicleEngine(arch="x86_64")
+        eng.enable_tracing()
+        code = (
+            b"\x48\xc7\xc0\x41\x00\x00\x00"  # mov rax, 0x41
+            b"\x48\xc7\xc3\x42\x00\x00\x00"  # mov rbx, 0x42
+            b"\x90\x90"                        # nop; nop
+        )
+        eng.memory_write(CODE_BASE, code)
+        result = eng.start(CODE_BASE, CODE_BASE + len(code))
+        self.assertEqual(result["status"], "ok", result)
+        trace = eng.get_trace()
+        self.assertEqual(len(trace), 4, trace)
+        self.assertIn("mov", trace[0]["instruction"].lower())
+        self.assertIn("nop", trace[2]["instruction"].lower())
+        eng.close()
+
+    def test_step(self):
+        eng = IcicleEngine(arch="x86_64")
+        code = (
+            b"\x48\xc7\xc0\x01\x00\x00\x00"  # mov rax, 1
+            b"\x48\xc7\xc3\x02\x00\x00\x00"  # mov rbx, 2
+            b"\x90"                            # nop
+        )
+        eng.memory_write(CODE_BASE, code)
+        eng.vm.pc = CODE_BASE
+        stepped = eng.step(1)
+        self.assertEqual(len(stepped), 1)
+        self.assertEqual(eng.register_read("rax"), 1)
+        stepped = eng.step(1)
+        self.assertEqual(eng.register_read("rbx"), 2)
+        eng.close()
+
+    def test_hook_address(self):
+        eng = IcicleEngine(arch="x86_64")
+        hits = []
+
+        def my_hook(engine, address):
+            hits.append(address)
+
+        eng.memory_write(CODE_BASE, b"\x90\x90\x90\x90")  # nop x4
+        hook_id = eng.hook_address(CODE_BASE + 2, my_hook)
+        self.assertTrue(hook_id.startswith("hook-"))
+        self.assertEqual(len(eng.list_hooks()), 1)
+        result = eng.start(CODE_BASE, CODE_BASE + 4)
+        self.assertEqual(result["status"], "ok", result)
+        # The hook must fire exactly once — a stalled step loop would record it
+        # thousands of times before the deadline.
+        self.assertEqual(hits, [CODE_BASE + 2])
+        self.assertTrue(eng.hook_remove(hook_id))
+        self.assertEqual(len(eng.hooks), 0)
+        eng.close()
+
+    def test_logging_hook_terminates(self):
+        """A hook with no callback must not stall the run loop."""
+        eng = IcicleEngine(arch="x86_64")
+        eng.memory_write(CODE_BASE, b"\x90\x90\x90\x90")
+        eng.hook_address(CODE_BASE + 1)  # logging-only hook
+        result = eng.start(CODE_BASE, CODE_BASE + 4, timeout_ms=5000)
+        self.assertEqual(result["status"], "ok", result)
+        logged = [t for t in eng.get_trace() if t["type"] == "hook"]
+        self.assertEqual(len(logged), 1, logged)
+        eng.close()
+
+    def test_self_modifying_code_reported(self):
+        """Intra-block self-modification is reported, not silently mis-run."""
+        eng = IcicleEngine(arch="x86_64")
+        # lea rsi,[rip+N]; add byte [rsi], 0xff; mov rax, <imm>
+        code = bytearray.fromhex("488d3500000000" "8006ff" "48c7c011000000")
+        imm_off = 13
+        code[3] = imm_off - 7
+        eng.memory_write(CODE_BASE, bytes(code))
+        result = eng.start(CODE_BASE, CODE_BASE + len(code))
+        self.assertEqual(result["status"], "self_modifying_code", result)
+        self.assertIn("self-modifying", result["error"].lower())
+        eng.close()
+
+    def test_snapshot_save_restore(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.register_write("rax", 0x1111)
+        eng.register_write("rbx", 0x2222)
+        eng.memory_write(CODE_BASE, b"\xca\xfe\xba\xbe")
+        snap_id = eng.snapshot_save("before")
+        eng.register_write("rax", 0x9999)
+        eng.memory_write(CODE_BASE, b"\x00\x00\x00\x00")
+        eng.snapshot_restore(snap_id)
+        self.assertEqual(eng.register_read("rax"), 0x1111)
+        self.assertEqual(eng.register_read("rbx"), 0x2222)
+        self.assertEqual(eng.memory_read(CODE_BASE, 4), b"\xca\xfe\xba\xbe")
+        self.assertEqual(len(eng.snapshot_list()), 1)
+        eng.close()
+
+    def test_memory_search(self):
+        eng = IcicleEngine(arch="x86_64")
+        pattern = b"\xCA\xFE\xBA\xBE"
+        eng.memory_write(CODE_BASE + 0x100, pattern)
+        eng.memory_write(CODE_BASE + 0x500, pattern)
+        results = eng.memory_search(pattern)
+        self.assertIn(CODE_BASE + 0x100, results)
+        self.assertIn(CODE_BASE + 0x500, results)
+        self.assertEqual(eng.memory_search(b"\xFF\xFE\xFD\xFC\xFB\xFA"), [])
+        eng.close()
+
+    def test_memory_map(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.memory_map(0xA000000, 0x1000, perms=7)
+        eng.memory_write(0xA000000, b"\x41\x42\x43")
+        self.assertEqual(eng.memory_read(0xA000000, 3), b"\x41\x42\x43")
+        eng.close()
+
+    def test_error_handling(self):
+        eng = IcicleEngine(arch="x86_64")
+        with self.assertRaises(RuntimeError):
+            eng.memory_read(0xFFFF0000000, 4)
+        eng.close()
+
+    def test_supported_architectures(self):
+        """Every mapped architecture instantiates and runs a trivial snippet."""
+        # (arch, shellcode setting a return reg to 0x41, reg name, expected)
+        snippets = {
+            "x86":       ("b841000000", "eax", 0x41),
+            "x86_64":    ("48c7c041000000", "rax", 0x41),
+            "arm":       ("4100a0e3", "r0", 0x41),
+            "arm_thumb": ("4120", "r0", 0x41),
+            "arm64":     ("200880d2", "x0", 0x41),
+            "mips":      ("24020041", "v0", 0x41),
+            "mips_le":   ("41000224", "v0", 0x41),
+            "riscv64":   ("13051004", "a0", 0x41),
+            "riscv32":   ("13051004", "a0", 0x41),
+            "ppc":       ("38600041", "r3", 0x41),
+            "ppc64":     ("38600041", "r3", 0x41),
+        }
+        for arch in ARCH_MAP:
+            eng = IcicleEngine(arch=arch)
+            self.assertEqual(eng.arch, arch)
+            self.assertTrue(len(eng.registers_read_all()) > 0, f"{arch} has no registers")
+            if arch in snippets:
+                hx, reg, want = snippets[arch]
+                code = bytes.fromhex(hx)
+                eng.memory_write(CODE_BASE, code)
+                eng.vm.pc = CODE_BASE
+                eng.step(1)
+                self.assertEqual(eng.register_read(reg), want,
+                                 f"{arch}: {reg}=0x{eng.register_read(reg):x}")
+            eng.close()
+
+    def test_arch_map_has_common_regs(self):
+        for arch in ARCH_MAP:
+            self.assertIn(arch, COMMON_REGS, f"No COMMON_REGS for {arch}")
+
+
+if __name__ == "__main__":
+    if not HAS_ICICLE:
+        print("icicle not installed; skipping Icicle engine tests")
+        sys.exit(0)
+    unittest.main(verbosity=2)

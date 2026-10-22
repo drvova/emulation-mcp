@@ -3,20 +3,10 @@
 import sys
 import os
 
-# Allow running as standalone script.
-# Temporarily stub out qiling_engine to avoid ImportError from engines/__init__.py
+# Allow running as standalone script. The engines package imports backends
+# lazily, so importing the Unicorn engine alone does not require qiling/icicle/angr.
 _project_root = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _project_root)
-
-# Create a stub for qiling_engine so engines/__init__.py doesn't fail
-import types
-_stub = types.ModuleType("engines.qiling_engine")
-
-class _QilingEngineStub:
-    pass
-
-_stub.QilingEngine = _QilingEngineStub
-sys.modules["engines.qiling_engine"] = _stub
 
 from engines.unicorn_engine import UnicornEngine, CODE_BASE
 

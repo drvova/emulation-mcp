@@ -10,16 +10,23 @@ import unittest
 # Ensure the project root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from engines.qiling_engine import (
-    QilingEngine,
-    resolve_arch,
-    resolve_os,
-    ARCH_MAP,
-    OS_MAP,
-    COMMON_REGS,
-)
-from engines.base import HookInfo, SnapshotInfo, TraceEntry
-from qiling.const import QL_ARCH, QL_OS
+try:
+    import qiling  # noqa: F401
+    HAS_QILING = True
+except ImportError:
+    HAS_QILING = False
+
+if HAS_QILING:
+    from engines.qiling_engine import (
+        QilingEngine,
+        resolve_arch,
+        resolve_os,
+        ARCH_MAP,
+        OS_MAP,
+        COMMON_REGS,
+    )
+    from engines.base import HookInfo, SnapshotInfo, TraceEntry
+    from qiling.const import QL_ARCH, QL_OS
 
 
 # Path to an optional real rootfs for integration tests
@@ -27,6 +34,7 @@ ROOTFS_PATH = os.environ.get("QILING_ROOTFS", "")
 HAS_ROOTFS = os.path.isdir(ROOTFS_PATH)
 
 
+@unittest.skipUnless(HAS_QILING, "qiling not installed")
 class TestArchMapping(unittest.TestCase):
     """Test architecture and OS string resolution."""
 
@@ -75,6 +83,7 @@ class TestArchMapping(unittest.TestCase):
         self.assertIn("Unsupported OS type", str(ctx.exception))
 
 
+@unittest.skipUnless(HAS_QILING, "qiling not installed")
 class TestCommonRegs(unittest.TestCase):
     """Test that common register lists are defined for key architectures."""
 
@@ -99,6 +108,7 @@ class TestCommonRegs(unittest.TestCase):
         self.assertIn("ra", COMMON_REGS["mips"])
 
 
+@unittest.skipUnless(HAS_QILING, "qiling not installed")
 class TestQilingEngineInit(unittest.TestCase):
     """Test QilingEngine initialization and error handling."""
 
@@ -139,6 +149,7 @@ class TestQilingEngineInit(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(HAS_QILING, "qiling not installed")
 class TestQilingEngineImport(unittest.TestCase):
     """Verify that the module imports cleanly."""
 
@@ -161,7 +172,7 @@ class TestQilingEngineImport(unittest.TestCase):
             self.assertIn(name, OS_MAP, f"Missing OS: {name}")
 
 
-@unittest.skipUnless(HAS_ROOTFS, f"Rootfs not found at {ROOTFS_PATH}")
+@unittest.skipUnless(HAS_QILING and HAS_ROOTFS, f"qiling/rootfs not available ({ROOTFS_PATH})")
 class TestQilingEngineIntegration(unittest.TestCase):
     """Integration tests that require a real rootfs.
 
