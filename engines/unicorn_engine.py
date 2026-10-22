@@ -450,13 +450,25 @@ class UnicornEngine(BaseEngine):
 
     def snapshot_save(self, label: str = "") -> str:
         self._touch()
+        # context_save captures registers only; also capture mapped memory so a
+        # restore fully resets state (needed e.g. for the fuzzing loop). Each
+        # region's bytes are stored unless the whole region is zero.
         ctx = self.uc.context_save()
+        mem: list[tuple[int, bytes]] = []
+        for begin, end, _perms in self.uc.mem_regions():
+            size = end - begin + 1
+            try:
+                data = bytes(self.uc.mem_read(begin, size))
+            except UcError:
+                continue
+            if data.strip(b"\x00"):
+                mem.append((begin, data))
         snap_id = self._gen_id("snap-")
         self.snapshots[snap_id] = SnapshotInfo(
             snapshot_id=snap_id,
             label=label or f"Snapshot {len(self.snapshots) + 1}",
             created_at=time.time(),
-            _data=ctx,
+            _data={"ctx": ctx, "mem": mem, "regions": list(self.uc.mem_regions())},
         )
         return snap_id
 
@@ -465,7 +477,21 @@ class UnicornEngine(BaseEngine):
         snap = self.snapshots.get(snapshot_id)
         if snap is None:
             raise KeyError(f"Snapshot '{snapshot_id}' not found. Available: {list(self.snapshots.keys())}")
-        self.uc.context_restore(snap._data)
+        data = snap._data
+        # Zero the regions that were mapped at save time, then restore the saved
+        # bytes, so memory written since the snapshot is rolled back too.
+        for begin, end, _perms in data["regions"]:
+            size = end - begin + 1
+            try:
+                self.uc.mem_write(begin, b"\x00" * size)
+            except UcError:
+                pass
+        for begin, chunk in data["mem"]:
+            try:
+                self.uc.mem_write(begin, chunk)
+            except UcError:
+                pass
+        self.uc.context_restore(data["ctx"])
 
     # -- Lifecycle --
 

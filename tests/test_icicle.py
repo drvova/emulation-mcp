@@ -453,6 +453,17 @@ class TestIcicleLinux(unittest.TestCase):
         self.assertGreater(result["instructions_executed"], 100)
         eng.close()
 
+    def test_mem_map_ranges_cover_loaded_image(self):
+        if not self._bin:
+            self.skipTest("could not compile a static test binary (gcc unavailable)")
+        eng = IcicleEngine(arch="x86_64", os="linux", binary_path=self._bin)
+        # The MMU enumeration should expose the loader's mappings (many more
+        # than a shellcode session's three), enabling background GDB on Linux.
+        ranges = eng.vm.mem_map_ranges()
+        self.assertGreater(len(ranges), 10, len(ranges))
+        self.assertGreater(sum(s for _, s in ranges), 0)
+        eng.close()
+
 
 if __name__ == "__main__":
     if not HAS_ICICLE:

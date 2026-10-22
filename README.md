@@ -57,10 +57,12 @@ much more of the framework, and the wrapper detects it automatically:
   blocks executed, for triage and fuzzing-style analysis.
 - **GDB remote stub** — `emu_gdb_serve` serves a GDB stub so you can attach a
   real `gdb` (`target remote host:port`). By default it runs the stub in a
-  **detached subprocess** seeded from a snapshot of the session, so the call
-  returns immediately and the MCP session stays responsive while you debug;
-  `emu_gdb_stop` ends it. Pass `background=false` for an in-process blocking
-  session (works for Linux-mode sessions too).
+  **detached subprocess** seeded from a full snapshot of the session (all mapped
+  memory + registers, enumerated from the MMU so loader/Linux mappings are
+  included), so the call returns immediately and the MCP session stays
+  responsive; `emu_gdb_stop` ends it. The background target has no live kernel,
+  so for a Linux program you can inspect and single-step but continuing through
+  a syscall needs `background=false` (in-process, with the live kernel).
 
 The stock wheel remains fully supported — these features simply light up when
 the extended binding is present (`emu_list_engines` / a session's capabilities
@@ -171,9 +173,9 @@ framework: it snapshots a baseline, then repeatedly restores it, writes a
 mutated input to a chosen address, runs a code range, keeps inputs that reach
 new coverage, and reports inputs that fault. It uses Icicle's native block
 coverage when available (very fast) and falls back to the instruction trace on
-any engine that can trace, so it works on Unicorn too. Full-fidelity memory
-reset needs Icicle's native snapshots (Unicorn snapshots restore registers
-only).
+any engine that can trace, so it works on Unicorn too. Memory is reset between
+runs on both engines (Unicorn snapshots now capture mapped memory, not just
+registers).
 
 ### Reaching the whole engine surface
 

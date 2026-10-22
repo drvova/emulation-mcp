@@ -303,6 +303,41 @@ class TestExtendedIcicleTools(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
+    def test_background_gdb_linux_session(self):
+        """Background GDB now works for Linux-mode sessions (fixed caveat)."""
+        import shutil, subprocess, tempfile, os as _os
+        sid = _new_session(engine="icicle", arch="x86_64")
+        has_gdb = "gdb" in server.sessions.get(sid).CAPABILITIES
+        has_linux = getattr(server.sessions.get(sid), "_has_linux", False)
+        _fn(server.emu_close_session)(sid)
+        if not (has_gdb and has_linux):
+            self.skipTest("binding lacks GDB or Linux support")
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        tmp = tempfile.mkdtemp()
+        src, out = _os.path.join(tmp, "t.c"), _os.path.join(tmp, "t")
+        with open(src, "w") as f:
+            f.write("int main(){return 0;}\n")
+        try:
+            subprocess.run(["gcc", "-static", "-O2", "-o", out, src],
+                           check=True, capture_output=True, timeout=60)
+        except Exception:
+            self.skipTest("could not build static binary")
+        info = _fn(server.emu_create_session)(
+            engine="icicle", arch="x86_64", binary_path=out,
+            engine_options={"os": "linux"})
+        sid = info.splitlines()[0].split(": ", 1)[1].strip()
+        try:
+            t = time.time()
+            msg = _fn(server.emu_gdb_serve)(sid, "127.0.0.1:54489",
+                                            timeout_secs=8, background=True)
+            self.assertLess(time.time() - t, 5.0)
+            self.assertIn("pid", msg.lower())  # no longer refused for Linux
+            self.assertNotIn("does not support Linux", msg)
+            self.assertIn("Stopped", _fn(server.emu_gdb_stop)(sid))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
 
 @unittest.skipUnless(HAS_ICICLE, "icicle not installed")
 class TestIcicleThroughServer(unittest.TestCase):

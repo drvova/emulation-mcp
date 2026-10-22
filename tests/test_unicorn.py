@@ -168,6 +168,26 @@ def test_snapshot_save_restore():
     print("  PASS: test_snapshot_save_restore")
 
 
+def test_snapshot_memory_rollback():
+    """Snapshots roll back memory as well as registers."""
+    eng = UnicornEngine(arch="x86_64")
+
+    eng.memory_write(CODE_BASE, b"\xAA\xBB\xCC\xDD")
+    snap_id = eng.snapshot_save("mem")
+
+    # Mutate existing bytes and write to a region that was zero at save time.
+    eng.memory_write(CODE_BASE, b"\x00\x11\x22\x33")
+    eng.memory_write(CODE_BASE + 0x40, b"\xFF\xFF")
+    assert eng.memory_read(CODE_BASE, 4) == b"\x00\x11\x22\x33"
+
+    eng.snapshot_restore(snap_id)
+    assert eng.memory_read(CODE_BASE, 4) == b"\xAA\xBB\xCC\xDD", "saved bytes not restored"
+    assert eng.memory_read(CODE_BASE + 0x40, 2) == b"\x00\x00", "post-snapshot write not rolled back"
+
+    eng.close()
+    print("  PASS: test_snapshot_memory_rollback")
+
+
 def test_memory_search():
     """Test searching for byte patterns in mapped memory."""
     eng = UnicornEngine(arch="x86_64")
@@ -314,6 +334,7 @@ ALL_TESTS = [
     test_execute_shellcode,
     test_step,
     test_snapshot_save_restore,
+    test_snapshot_memory_rollback,
     test_memory_search,
     test_memory_map,
     test_hook_address,

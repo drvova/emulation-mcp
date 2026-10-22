@@ -685,6 +685,18 @@ impl Icicle {
         self.vm.get_disasm(address).map(|s| s.to_string())
     }
 
+    /// (start, size) pairs for every currently mapped memory range. Works for
+    /// any session (including OS-loaded images), unlike wrapper-side region
+    /// tracking which only knows about explicitly mapped regions.
+    pub fn mem_map_ranges(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        // RangeMap yields inclusive (start, end); size = end - start + 1.
+        for (start, end, _entry) in self.vm.cpu.mem.get_mapping().iter() {
+            out.push((start, end - start + 1));
+        }
+        out
+    }
+
     /// (start, length) pairs for every instruction in the block group that
     /// begins at `address`. Empty if the address cannot be lifted.
     pub fn get_block_info(&mut self, address: u64) -> Vec<(u64, u64)> {

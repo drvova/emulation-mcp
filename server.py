@@ -104,22 +104,40 @@ _GDB_RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "icicle_ext", "gdb_server_runner.py")
 
 
+_GDB_DUMP_BYTE_CAP = 64 * 1024 * 1024  # don't dump bytes for ranges larger than this
+
+
 def _dump_icicle_state(engine) -> dict:
     """Serialize an Icicle session's state for a fresh VM to restore.
 
-    Captures the icicle arch string, tracked memory regions (zero regions are
-    recorded without bytes), all <=64-bit registers, and pc/sp.
+    Captures the icicle arch string, the real mapped memory ranges (via the
+    MMU, so OS-loaded images are included), zero/oversized ranges without bytes,
+    all <=64-bit registers, and pc/sp.
     """
     vm = engine.vm
-    regions = []
-    for base, (size, perms) in sorted(engine._regions.items()):
-        hexbytes = ""
+    # Prefer true MMU enumeration (covers Linux/loader mappings); fall back to
+    # the wrapper's tracked regions on an older binding.
+    ranges: list[tuple[int, int, int]] = []
+    if hasattr(vm, "mem_map_ranges"):
         try:
-            data = bytes(vm.mem_read(base, size))
-            if data.strip(b"\x00"):      # skip all-zero regions (mapped zeroed anyway)
-                hexbytes = data.hex()
+            ranges = [(base, size, 7) for base, size in vm.mem_map_ranges()]
         except Exception:
-            pass
+            ranges = []
+    if not ranges:
+        ranges = [(base, size, perms) for base, (size, perms) in sorted(engine._regions.items())]
+
+    regions = []
+    for base, size, perms in ranges:
+        if size <= 0:
+            continue
+        hexbytes = ""
+        if size <= _GDB_DUMP_BYTE_CAP:
+            try:
+                data = bytes(vm.mem_read(base, size))
+                if data.strip(b"\x00"):   # skip all-zero ranges (mapped zeroed anyway)
+                    hexbytes = data.hex()
+            except Exception:
+                pass
         regions.append([base, size, perms, hexbytes])
     regs = {}
     try:
@@ -1895,12 +1913,15 @@ def emu_gdb_serve(
     Attach from another terminal with:  gdb -ex "target remote <address>".
 
     background=True (default): the stub runs in a DETACHED SUBPROCESS seeded from
-      a snapshot of the current session, and this call returns immediately — the
-      MCP session stays responsive. The subprocess waits up to `timeout_secs`
-      for a client, then serves until it detaches. Use emu_gdb_stop to end it.
-      (Icicle non-Linux sessions; the debugged target is a copy of the session.)
+      a snapshot of the current session (all mapped memory + registers, incl.
+      Linux/loader mappings), and this call returns immediately — the MCP session
+      stays responsive. The subprocess waits up to `timeout_secs` for a client,
+      then serves until it detaches. Use emu_gdb_stop to end it. The target is a
+      memory+register copy with no live kernel, so for a Linux program you can
+      inspect and single-step, but continuing through a syscall needs
+      background=False.
     background=False: serve in-process (blocks this session until the client
-      detaches or the wait times out). Works for any Icicle session, incl. Linux.
+      detaches or the wait times out), with the live kernel for Linux sessions.
 
     session_id: Active session ID.
     address: host:port to listen on (default 127.0.0.1:1234).
@@ -1914,11 +1935,12 @@ def emu_gdb_serve(
         if not background:
             return engine.gdb_serve(address, timeout_secs)
 
-        # Non-blocking: dump state and serve from a detached subprocess.
-        if getattr(engine, "_linux", False):
-            return ("Error: background GDB does not support Linux-mode sessions "
-                    "(live kernel mappings aren't portable). Re-run with "
-                    "background=false for a blocking in-process session.")
+        # Non-blocking: dump state (incl. Linux/loader mappings via mem_map_ranges)
+        # and serve from a detached subprocess.
+        if getattr(engine, "_linux", False) and not hasattr(engine.vm, "mem_map_ranges"):
+            return ("Error: background GDB for a Linux-mode session needs the "
+                    "extended binding's mem_map_ranges(); rebuild with "
+                    "icicle_ext/build.sh, or re-run with background=false.")
         if not os.path.exists(_GDB_RUNNER):
             return f"Error: GDB runner script not found at {_GDB_RUNNER}."
         _stop_gdb(session_id)  # replace any existing server for this session
