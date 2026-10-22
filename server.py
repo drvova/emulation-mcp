@@ -691,6 +691,7 @@ def emu_create_session(
             eng = engine_cls(
                 binary_path=binary_path, rootfs=rootfs, arch=arch,
                 ostype=ostype, args=args or [], enable_trace=enable_trace,
+                **opts,
             )
         elif engine == "angr" and binary_path:
             _validate_binary_path(binary_path)  # EM-1
@@ -1991,6 +1992,67 @@ def emu_capture_output(session_id: str, action: str = "start") -> str:
         return str(e)
     except Exception as e:
         return f"Capture output error: {e}"
+
+
+@mcp.tool()
+def emu_syscall_stats(session_id: str, limit: int = 40) -> str:
+    """Show syscall usage counts after a run (Qiling).
+
+    Reports how many times each syscall was invoked and a sample of strings the
+    program passed to the OS — a quick behavioural fingerprint. Run the program
+    first.
+
+    session_id: Active session ID.
+    limit: Max syscalls to list (default 40).
+    """
+    try:
+        engine = sessions.get(session_id)
+        r = engine.syscall_stats()
+        sys = r.get("syscalls", {})
+        if not sys:
+            return "No syscalls recorded (run the program first)."
+        items = sorted(sys.items(), key=lambda kv: kv[1], reverse=True)
+        lines = [f"Syscalls ({r.get('total', sum(sys.values()))} total, {len(sys)} distinct):"]
+        for name, count in items[:limit]:
+            lines.append(f"  {count:>6}  {name}")
+        strings = r.get("strings") or []
+        if strings:
+            lines.append(f"Observed strings ({len(strings)}): "
+                         + ", ".join(repr(s) for s in strings[:8]))
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Syscall stats error: {e}"
+
+
+@mcp.tool()
+def emu_list_threads(session_id: str) -> str:
+    """List the guest's threads (Qiling multithreaded runs).
+
+    Multithreading is enabled per session with
+    engine_options={"multithread": true} at creation; thread scheduling is
+    best-effort. For a single-threaded program this reports that.
+
+    session_id: Active session ID.
+    """
+    try:
+        engine = sessions.get(session_id)
+        r = engine.list_threads()
+        if r.get("note"):
+            return f"Threads: {r['note']} (multithread={r.get('multithread')})."
+        lines = [f"Threads ({r.get('count', 0)}, current={r.get('current')}):"]
+        for t in r.get("threads", []):
+            lines.append(f"  id={t.get('id')} status={t.get('status')}")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"List threads error: {e}"
 
 
 @mcp.tool()

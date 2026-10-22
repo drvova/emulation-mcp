@@ -103,6 +103,7 @@ class QilingEngine(BaseEngine):
         ostype: str = "linux",
         args: list[str] | None = None,
         enable_trace: bool = False,
+        multithread: bool = False,
     ):
         super().__init__(arch=arch)
         self.engine_type = "qiling"
@@ -112,6 +113,7 @@ class QilingEngine(BaseEngine):
         self._ql_arch = resolve_arch(arch)
         self._ql_os = resolve_os(ostype)
         self._has_run = False
+        self._multithread = bool(multithread)
         # Output-capture buffers, populated by capture_output().
         self._cap_stdout: bytearray | None = None
         self._cap_stderr: bytearray | None = None
@@ -128,6 +130,7 @@ class QilingEngine(BaseEngine):
                 argv=[binary_path] + args,
                 rootfs=rootfs,
                 verbose=verbose,
+                multithread=self._multithread,
             )
         except QlErrorFileNotFound as e:
             raise RuntimeError(
@@ -429,6 +432,66 @@ class QilingEngine(BaseEngine):
             description="Interrupt hook", _handle=handle,
         )
         return hook_id
+
+    @staticmethod
+    def _resolve_insn(insn: str) -> int:
+        """Map an x86 instruction name to its Unicorn instruction id."""
+        from unicorn import x86_const
+        key = str(insn).lower().strip()
+        table = {
+            "syscall": "UC_X86_INS_SYSCALL", "sysenter": "UC_X86_INS_SYSENTER",
+            "cpuid": "UC_X86_INS_CPUID", "in": "UC_X86_INS_IN", "out": "UC_X86_INS_OUT",
+        }
+        const = table.get(key)
+        if const is None or not hasattr(x86_const, const):
+            raise ValueError(f"Unsupported instruction '{insn}'. Supported: {sorted(table)}")
+        return getattr(x86_const, const)
+
+    def hook_insn(self, callback: Callable, insn: str) -> str:
+        """Fire a callback whenever a specific instruction executes.
+
+        insn is one of syscall/sysenter/cpuid/in/out (x86/x64). The callback gets
+        Qiling's native signature for that instruction type; returning True skips
+        the instruction. Install before running; remove with hook_remove().
+        """
+        self._touch()
+        insn_id = self._resolve_insn(insn)
+        handle = self.ql.hook_insn(callback, insn_id)
+        hook_id = self._gen_id("hinsn-")
+        self.hooks[hook_id] = HookInfo(
+            hook_id=hook_id, hook_type="insn", target=str(insn).lower(),
+            description=f"Instruction hook on '{insn}'", _handle=handle,
+        )
+        return hook_id
+
+    def syscall_stats(self) -> dict[str, Any]:
+        """Return syscall usage counts and observed strings gathered during a run."""
+        self._touch()
+        stats = getattr(self.ql.os, "stats", None)
+        if stats is None:
+            return {"syscalls": {}, "strings": [], "note": "stats unavailable"}
+        syscalls: dict[str, int] = {}
+        for k, v in dict(getattr(stats, "syscalls", {}) or {}).items():
+            # Qiling records each syscall as a list of call entries; use the count.
+            syscalls[str(k)] = len(v) if isinstance(v, (list, tuple, set, dict)) else int(v)
+        strings = [str(s) for s in (getattr(stats, "strings", []) or [])][:64]
+        return {"syscalls": syscalls, "total": sum(syscalls.values()), "strings": strings}
+
+    def list_threads(self) -> dict[str, Any]:
+        """Report the guest's thread state (populated for multithreaded runs)."""
+        self._touch()
+        tm = getattr(self.ql.os, "thread_management", None)
+        if tm is None:
+            return {"multithread": self._multithread, "threads": [],
+                    "note": "single-threaded (or run not started)"}
+        threads = getattr(tm, "threads", None) or []
+        out = []
+        for t in threads:
+            out.append({"id": getattr(t, "id", getattr(t, "get_id", lambda: None)()),
+                        "status": str(getattr(t, "status", ""))})
+        cur = getattr(tm, "cur_thread", None)
+        return {"multithread": self._multithread, "count": len(out),
+                "current": getattr(cur, "id", None), "threads": out}
 
     def hook_remove(self, hook_id: str) -> bool:
         info = self.hooks.get(hook_id)

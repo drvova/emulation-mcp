@@ -334,6 +334,18 @@ class BaseEngine(ABC):
         """Fire a callback on every interrupt/exception. 'callback_hooks'."""
         raise NotImplementedError(f"Interrupt hooks are not supported by the '{self.engine_type}' engine")
 
+    def hook_insn(self, callback: Callable, insn: str) -> str:
+        """Fire a callback on a specific instruction type (syscall/cpuid/in/out). 'callback_hooks'."""
+        raise NotImplementedError(f"Instruction-type hooks are not supported by the '{self.engine_type}' engine")
+
+    def syscall_stats(self) -> dict[str, Any]:
+        """Return syscall usage counts and observed strings after a run."""
+        raise NotImplementedError(f"Syscall statistics are not supported by the '{self.engine_type}' engine")
+
+    def list_threads(self) -> dict[str, Any]:
+        """Return the guest's thread state (multithreaded binaries)."""
+        raise NotImplementedError(f"Thread listing is not supported by the '{self.engine_type}' engine")
+
     def memory_maps(self) -> list[dict[str, Any]]:
         """List the guest's mapped memory regions (start/end/perms/label)."""
         raise NotImplementedError(f"Memory-map listing is not supported by the '{self.engine_type}' engine")

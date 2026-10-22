@@ -710,6 +710,25 @@ class TestQilingThroughServer(unittest.TestCase):
             self.assertIn("not supported", _fn(server.emu_fs_map)(sid, "/x", "/etc/hostname"))
             self.assertIn("not supported", _fn(server.emu_memory_maps)(sid))
             self.assertIn("not supported", _fn(server.emu_capture_output)(sid, "start"))
+            self.assertIn("not supported", _fn(server.emu_syscall_stats)(sid))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_syscall_stats_and_threads_via_server(self):
+        sid = self._session("hello")
+        try:
+            _fn(server.emu_run)(sid)
+            self.assertIn("Syscalls", _fn(server.emu_syscall_stats)(sid))
+            self.assertIn("Threads", _fn(server.emu_list_threads)(sid))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_multithread_option_via_server(self):
+        sid = _new_session(engine="qiling", binary_path=self.bins["hello"],
+                           rootfs=self.rootfs, arch="x86_64", ostype="linux",
+                           engine_options={"multithread": True})
+        try:
+            self.assertTrue(server.sessions.get(sid)._multithread)
         finally:
             _fn(server.emu_close_session)(sid)
 

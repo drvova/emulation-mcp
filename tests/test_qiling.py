@@ -388,6 +388,46 @@ class TestQilingExtended(unittest.TestCase):
         self.assertEqual(eng.read_string(addr), "hello world")
         eng.close()
 
+    def test_hook_insn_syscall_fires(self):
+        eng = self._engine("hello")
+        count = [0]
+        eng.hook_insn(lambda ql: count.__setitem__(0, count[0] + 1), "syscall")
+        eng.start()
+        self.assertGreater(count[0], 0)
+        eng.close()
+
+    def test_hook_insn_bad_name(self):
+        eng = self._engine("hello")
+        with self.assertRaises(ValueError):
+            eng.hook_insn(lambda ql: None, "frobnicate")
+        eng.close()
+
+    def test_syscall_stats(self):
+        eng = self._engine("hello")
+        eng.start()
+        stats = eng.syscall_stats()
+        self.assertGreater(stats["total"], 0)
+        self.assertGreater(len(stats["syscalls"]), 0)
+        self.assertTrue(all(isinstance(v, int) for v in stats["syscalls"].values()))
+        eng.close()
+
+    def test_list_threads_single(self):
+        eng = self._engine("hello")
+        eng.start()
+        r = eng.list_threads()
+        self.assertFalse(r.get("multithread"))
+        eng.close()
+
+    def test_multithread_option_accepted(self):
+        # The constructor accepts multithread=True; a threaded static binary runs.
+        eng = QilingEngine(binary_path=self.bins["hello"], rootfs=self.rootfs,
+                           arch="x86_64", ostype="linux", multithread=True)
+        self.assertTrue(eng._multithread)
+        eng.capture_output()
+        eng.start()
+        self.assertEqual(eng.get_output()["stdout"], "hi from qiling\n")
+        eng.close()
+
 
 if __name__ == "__main__":
     # Print diagnostic info

@@ -29,7 +29,15 @@ each can do.
 - **Native disassembly** (`emu_disassemble`), **full register introspection**
   (`emu_list_registers`), **memory-map listing** (`emu_memory_maps`) and
   C-string reads (`emu_read_string`)
+- **Behavioural stats** — `emu_syscall_stats` reports a syscall histogram and the
+  strings the program passed to the OS; `engine.hook_insn` (via `emu_eval`) fires
+  on specific instructions (`syscall`/`cpuid`/`in`/`out`)
+- **Multithreading** — create the session with `engine_options={"multithread":
+  true}` and inspect threads with `emu_list_threads` (scheduling is best-effort)
 - Persistent sessions with state preservation; native snapshot/restore
+- Beyond Linux, the engine also accepts `ostype` `windows`/`uefi`/`dos`/`macos`/
+  `freebsd` — those need a matching rootfs (e.g. Windows DLLs) you supply; only
+  Linux is exercised by the bundled tests
 
 ### Icicle — SLEIGH-based CPU emulation *(new)*
 - CPU emulator built on Ghidra's SLEIGH instruction semantics
@@ -150,6 +158,9 @@ show which are active).
 | filesystem mapping  |         |   ✓    |        |      |
 | stdin / stdout I/O  |         |   ✓    |        |      |
 | memory-map listing  |         |   ✓    |        |      |
+| syscall statistics  |         |   ✓    |        |      |
+| instruction hooks   |         |   ✓    |        |      |
+| multithreading      |         |   ✓    |        |      |
 | reverse execution   |         |        |  ✓ †   |      |
 | call stack          |         |        |  ✓ †   |      |
 | wide registers      |         |        |  ✓ †   |      |
@@ -209,6 +220,7 @@ Engine-specific tools:
 - `emu_hook_syscall`, `emu_hook_api` — Qiling only (with `when="call"/"enter"/"exit"`)
 - `emu_fs_map`, `emu_set_stdin`, `emu_capture_output` — filesystem mapping and stdin/stdout I/O (Qiling)
 - `emu_memory_maps`, `emu_read_string` — list mapped regions / read a C string (Qiling)
+- `emu_syscall_stats`, `emu_list_threads` — syscall histogram / thread listing (Qiling)
 - `emu_set_symbolic_register`, `emu_set_symbolic_memory`, `emu_explore`, `emu_solve` — angr only
 - `emu_constrain`, `emu_value_range` — add solver constraints / query a variable's range (angr)
 - `emu_cfg`, `emu_call_function` — CFG/function listing and function execution (angr)
