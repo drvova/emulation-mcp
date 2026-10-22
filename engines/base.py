@@ -90,6 +90,10 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "sim_procedures": "Replace or skip functions with Python stubs (SimProcedures)",
     "callback_hooks": "Register Python callbacks that fire during emulation",
     "memory_hooks": "Register Python callbacks on guest memory reads/writes (watchpoints)",
+    "pcode_il": "Lift code to the engine's p-code intermediate language",
+    "mmio": "Map memory-mapped I/O regions serviced by Python callbacks",
+    "cmplog": "Compare logging (RedQueen / input-to-state): record compare operands",
+    "symbols": "Resolve addresses to symbols and back (ELF symbol table + DWARF)",
     "filesystem": "Map host files/directories into the emulated filesystem",
     "io": "Feed the guest's stdin and capture its stdout/stderr",
     "wide_registers": "Read/write registers wider than 64 bits (vector/flag aggregates)",
@@ -229,6 +233,43 @@ class BaseEngine(ABC):
     def disassemble(self, address: int, count: int = 1) -> list[dict[str, Any]]:
         """Disassemble `count` instructions from `address`. 'disassembly' capability."""
         raise NotImplementedError(f"Native disassembly is not supported by the '{self.engine_type}' engine")
+
+    def get_pcode(self, address: int) -> str:
+        """Lift the block at `address` to p-code IL text. 'pcode_il' capability."""
+        raise NotImplementedError(f"P-code lifting is not supported by the '{self.engine_type}' engine")
+
+    def map_mmio(self, start: int, size: int, read_cb: Callable | None = None,
+                 write_cb: Callable | None = None) -> None:
+        """Map an MMIO region serviced by Python callbacks. 'mmio' capability."""
+        raise NotImplementedError(f"MMIO mapping is not supported by the '{self.engine_type}' engine")
+
+    def enable_cmplog(self, instrument_calls: bool = False) -> None:
+        """Instrument comparisons to record operand pairs (RedQueen). 'cmplog'."""
+        raise NotImplementedError(f"Compare logging is not supported by the '{self.engine_type}' engine")
+
+    def get_cmplog(self) -> list[dict[str, Any]]:
+        """Return the recorded compare operands. 'cmplog' capability."""
+        raise NotImplementedError(f"Compare logging is not supported by the '{self.engine_type}' engine")
+
+    def clear_cmplog(self) -> None:
+        """Clear recorded compare operands (instrumentation stays). 'cmplog'."""
+        raise NotImplementedError(f"Compare logging is not supported by the '{self.engine_type}' engine")
+
+    def load_symbols(self, path: str, load_address: int = 0) -> int:
+        """Load an ELF's symbol table / DWARF for symbolization. 'symbols'."""
+        raise NotImplementedError(f"Symbolization is not supported by the '{self.engine_type}' engine")
+
+    def symbolize(self, address: int) -> dict[str, Any] | None:
+        """Resolve an address to {name, offset, source?}. 'symbols' capability."""
+        raise NotImplementedError(f"Symbolization is not supported by the '{self.engine_type}' engine")
+
+    def lookup_symbol(self, name: str) -> int | None:
+        """Resolve a symbol name to its address. 'symbols' capability."""
+        raise NotImplementedError(f"Symbolization is not supported by the '{self.engine_type}' engine")
+
+    def list_symbols(self) -> list[dict[str, Any]]:
+        """List loaded symbols as {address, size, name, kind}. 'symbols'."""
+        raise NotImplementedError(f"Symbolization is not supported by the '{self.engine_type}' engine")
 
     def enable_coverage(self) -> None:
         """Start recording executed basic blocks. 'coverage' capability."""

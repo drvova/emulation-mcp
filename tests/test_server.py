@@ -346,6 +346,104 @@ class TestExtendedIcicleTools(unittest.TestCase):
             _fn(server.emu_close_session)(sid)
             server.ENABLE_EVAL = orig
 
+    def test_pcode_via_server(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            if "pcode_il" not in server.sessions.get(sid).CAPABILITIES:
+                self.skipTest("binding lacks p-code lifting")
+            _fn(server.emu_memory_write)(sid, "0x1000000", "b80100000083c002")
+            out = _fn(server.emu_pcode)(sid, "0x1000000")
+            self.assertIn("MOV", out.upper())
+            self.assertIn("RAX", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_mmio_via_eval(self):
+        """MMIO regions are driveable through emu_eval (callbacks)."""
+        orig = server.ENABLE_EVAL
+        server.ENABLE_EVAL = True
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            if "mmio" not in server.sessions.get(sid).CAPABILITIES:
+                self.skipTest("binding lacks MMIO")
+            _fn(server.emu_memory_write)(sid, "0x1000000", "8b042500000040")  # mov eax,[0x40000000]
+            out = _fn(server.emu_eval)(sid,
+                "engine.map_mmio(0x40000000, 0x1000, read_cb=lambda a, s: 0x11223344)\n"
+                "engine.register_write('rip', 0x1000000)\n"
+                "engine.step(1)\n"
+                "result = hex(engine.register_read('rax'))")
+            self.assertIn("0x11223344", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+            server.ENABLE_EVAL = orig
+
+    def test_pcode_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_pcode)(sid, "0x1000000"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_cmplog_via_server(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            if "cmplog" not in server.sessions.get(sid).CAPABILITIES:
+                self.skipTest("binding lacks compare logging")
+            self.assertIn("enabled", _fn(server.emu_cmplog)(sid, "enable").lower())
+            # cmp eax,0x1337cafe ; jne +3 ; nop*3 ; nop ; hlt  (rax set at runtime)
+            _fn(server.emu_memory_write)(sid, "0x1000000", "3dfeca371375039090909090f4")
+            _fn(server.emu_register_write)(sid, "rax", "0x41414141")
+            _fn(server.emu_run)(sid, "0x1000000", "")
+            out = _fn(server.emu_cmplog)(sid, "get")
+            self.assertIn("0x41414141", out)
+            self.assertIn("0x1337cafe", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_cmplog_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_cmplog)(sid, "get"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_symbols_via_server(self):
+        import shutil, subprocess, tempfile
+        sid = _new_session(engine="icicle", arch="x86_64")
+        has = "symbols" in server.sessions.get(sid).CAPABILITIES
+        if not has:
+            _fn(server.emu_close_session)(sid)
+            self.skipTest("binding lacks symbolization")
+        if shutil.which("gcc") is None:
+            _fn(server.emu_close_session)(sid)
+            self.skipTest("gcc unavailable")
+        d = tempfile.mkdtemp()
+        src, out = os.path.join(d, "s.c"), os.path.join(d, "s")
+        with open(src, "w") as f:
+            f.write("int my_secret_func(int a){return a*3+1;}\nint main(void){return my_secret_func(7);}\n")
+        try:
+            subprocess.run(["gcc", "-static", "-no-pie", "-g", "-O0", "-o", out, src],
+                           check=True, capture_output=True, timeout=60)
+        except Exception:
+            _fn(server.emu_close_session)(sid)
+            self.skipTest("could not build symbol'd binary")
+        try:
+            self.assertIn("Loaded", _fn(server.emu_load_symbols)(sid, out))
+            lk = _fn(server.emu_lookup_symbol)(sid, "my_secret_func")
+            self.assertIn("my_secret_func = 0x", lk)
+            addr = lk.split("= ")[1]
+            self.assertIn("my_secret_func", _fn(server.emu_symbolize)(sid, addr))
+            self.assertIn("my_secret_func", _fn(server.emu_list_symbols)(sid, "secret"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_symbols_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_lookup_symbol)(sid, "main"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
     def test_coverage_via_server(self):
         sid = _new_session(engine="icicle", arch="x86_64")
         try:

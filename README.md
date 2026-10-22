@@ -84,6 +84,19 @@ much more of the framework, and the wrapper detects it automatically:
   memory tracing. Remove with `engine.hook_remove(id)`.
 - **Wide registers** — `emu_register_read_wide` / `emu_register_write_wide`
   read/write registers wider than 64 bits (XMM/YMM/vector/flag aggregates).
+- **P-code IL** — `emu_pcode` lifts a block to the SLEIGH intermediate language
+  (the semantic IR the VM actually executes, instructions interleaved) — the
+  basis for taint, symbolic reasoning, and semantic diffing.
+- **MMIO regions** — `engine.map_mmio(start, size, read_cb, write_cb)` (via
+  `emu_eval`) maps memory-mapped I/O whose reads/writes are *serviced* by Python
+  callbacks rather than backed by RAM — device/peripheral registers, not just
+  observed like a watchpoint.
+- **Compare logging (RedQueen)** — `emu_cmplog` records the concrete operand
+  pairs seen at each comparison during a run (input-to-state): it tells a fuzzer
+  exactly which bytes a magic-value or checksum check wants.
+- **Symbolization** — `emu_load_symbols` reads an ELF's symbol table (and DWARF),
+  then `emu_symbolize` (address → `name+offset`), `emu_lookup_symbol`
+  (name → address) and `emu_list_symbols` make traces and crashes readable.
 - **GDB remote stub** — `emu_gdb_serve` serves a GDB stub so you can attach a
   real `gdb` (`target remote host:port`). By default it runs the stub in a
   **detached subprocess** seeded from a full snapshot of the session (all mapped
@@ -155,6 +168,10 @@ show which are active).
 | native disassembly  |         |   ✓    |  ✓ †   |      |
 | callback hooks      |         |   ✓    |  ✓ †   |      |
 | memory hooks        |         |   ✓    |  ✓ †   |      |
+| p-code IL           |         |        |  ✓ †   |      |
+| MMIO regions        |         |        |  ✓ †   |      |
+| compare logging     |         |        |  ✓ †   |      |
+| symbolization       |         |        |  ✓ †   |      |
 | filesystem mapping  |         |   ✓    |        |      |
 | stdin / stdout I/O  |         |   ✓    |        |      |
 | memory-map listing  |         |   ✓    |        |      |
@@ -229,6 +246,10 @@ architecture. See the [Qiling documentation](https://docs.qiling.io/) for setup.
 
 ## Tools
 
+See [CAPABILITIES.md](CAPABILITIES.md) for the full reference: every tool grouped
+by category, the per-engine capability matrix, and which engine each tool
+targets.
+
 Session/exec/memory/register/hook/snapshot/trace tools are shared across engines
 (`emu_create_session`, `emu_run`, `emu_step`, `emu_memory_*`, `emu_registers_read`,
 `emu_register_write`, `emu_hook_address`, `emu_snapshot_*`, `emu_get_trace`, ...).
@@ -250,6 +271,9 @@ Engine-specific tools:
 - `emu_list_registers` — full register-file introspection (Icicle, Qiling)
 - `emu_step_back`, `emu_goto_icount` — reverse execution / time-travel (extended Icicle)
 - `emu_disassemble` — native disassembly (extended Icicle, Qiling); `emu_callstack` — call stack (extended Icicle)
+- `emu_pcode` — lift a block to SLEIGH p-code IL (extended Icicle)
+- `emu_cmplog` — compare logging / RedQueen operand capture (extended Icicle)
+- `emu_load_symbols`, `emu_symbolize`, `emu_lookup_symbol`, `emu_list_symbols` — ELF/DWARF symbolization (extended Icicle)
 - `emu_coverage` — basic-block coverage enable/get/clear (extended Icicle)
 - `emu_gdb_serve` / `emu_gdb_stop` — serve a GDB remote stub (non-blocking by
   default) to attach a real debugger (extended Icicle)

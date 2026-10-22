@@ -241,12 +241,24 @@ class IcicleEngine(BaseEngine):
         self._has_callback_hooks = hasattr(self.vm, "add_py_block_hook")
         self._has_wide_regs = hasattr(self.vm, "reg_read_bytes")
         self._has_mem_hooks = hasattr(self.vm, "add_mem_write_hook")
+        self._has_pcode = hasattr(self.vm, "get_pcode")
+        self._has_mmio = hasattr(self.vm, "map_mmio")
+        self._has_cmplog = hasattr(self.vm, "enable_cmplog")
+        self._has_symbols = hasattr(self.vm, "load_symbols")
 
         caps = set(type(self).CAPABILITIES)
         if self._has_callback_hooks:
             caps.add("callback_hooks")
         if self._has_mem_hooks:
             caps.add("memory_hooks")
+        if self._has_pcode:
+            caps.add("pcode_il")
+        if self._has_mmio:
+            caps.add("mmio")
+        if self._has_cmplog:
+            caps.add("cmplog")
+        if self._has_symbols:
+            caps.add("symbols")
         if self._has_wide_regs:
             caps.add("wide_registers")
         if self._has_reverse:
@@ -731,6 +743,126 @@ class IcicleEngine(BaseEngine):
             out.append({"address": f"0x{addr:x}", "instruction": text, "size": size})
             addr += size
         return out
+
+    def get_pcode(self, address: int) -> str:
+        """Lift the block at `address` to p-code IL text (instructions interleaved)."""
+        self._touch()
+        if not self._has_pcode:
+            raise NotImplementedError(
+                "P-code lifting requires the extended Icicle binding (icicle_ext/)."
+            )
+        text = self.vm.get_pcode(address)
+        if text is None:
+            raise ValueError(f"Could not lift p-code at 0x{address:x} (unmapped or undecodable).")
+        return text
+
+    # -- MMIO: regions serviced by Python callbacks (extended binding) --
+
+    def map_mmio(self, start: int, size: int, read_cb: Callable | None = None,
+                 write_cb: Callable | None = None) -> None:
+        """Map [start, start+size) as MMIO serviced by Python callbacks.
+
+        read_cb(addr, size) -> value (bytes or int, little-endian) supplies what
+        a read sees; write_cb(addr, data: bytes) observes writes. Either may be
+        None. The region has no RAM backing — it models device registers. The
+        callbacks are observe/serve-only and must not re-enter this engine.
+        """
+        self._touch()
+        if not self._has_mmio:
+            raise NotImplementedError(
+                "MMIO regions require the extended Icicle binding (icicle_ext/)."
+            )
+        if not self.vm.map_mmio(start, size, read_cb, write_cb):
+            raise RuntimeError(f"Failed to map MMIO region at 0x{start:x} (size=0x{size:x}).")
+
+    # -- Compare logging / RedQueen (extended binding) --
+
+    def enable_cmplog(self, instrument_calls: bool = False) -> None:
+        """Instrument comparisons to record the concrete operand pairs seen at
+        each one — the input-to-state (RedQueen) signal a fuzzer uses to solve
+        magic-value and checksum checks. Install before running. Note a compare
+        whose operands are both statically constant in its block is dropped as
+        uninteresting; the interesting case is a runtime/input-derived operand.
+        """
+        self._touch()
+        if not self._has_cmplog:
+            raise NotImplementedError(
+                "Compare logging requires the extended Icicle binding (icicle_ext/)."
+            )
+        self.vm.enable_cmplog(instrument_calls)
+
+    def get_cmplog(self) -> list[dict[str, Any]]:
+        """Return observed compares: a list of {address, kind, operands:[[a,b]...]}
+        for each instrumented compare site that executed."""
+        self._touch()
+        if not self._has_cmplog:
+            raise NotImplementedError(
+                "Compare logging requires the extended Icicle binding (icicle_ext/)."
+            )
+        out: list[dict[str, Any]] = []
+        for addr, kind, pairs in self.vm.get_cmplog():
+            out.append({"address": f"0x{addr:x}", "kind": kind,
+                        "operands": [[a, b] for a, b in pairs]})
+        return out
+
+    def clear_cmplog(self) -> None:
+        """Clear recorded compare operands (instrumentation stays installed)."""
+        self._touch()
+        if self._has_cmplog:
+            self.vm.clear_cmplog()
+
+    # -- Symbolization (extended binding) --
+
+    def load_symbols(self, path: str, load_address: int = 0) -> int:
+        """Load an ELF's symbol table / DWARF so addresses can be symbolized.
+
+        load_address relocates PIE/dynamic objects; it is ignored for static /
+        non-PIE executables. Returns the number of symbols now known. May be
+        called repeatedly to merge symbols from several files.
+        """
+        self._touch()
+        if not self._has_symbols:
+            raise NotImplementedError(
+                "Symbolization requires the extended Icicle binding (icicle_ext/)."
+            )
+        return self.vm.load_symbols(path, load_address)
+
+    def symbolize(self, address: int) -> dict[str, Any] | None:
+        """Resolve an address to {name, offset, source?}, or None if unknown."""
+        self._touch()
+        if not self._has_symbols:
+            raise NotImplementedError(
+                "Symbolization requires the extended Icicle binding (icicle_ext/)."
+            )
+        res = self.vm.symbolize(address)
+        if res is None:
+            return None
+        name, offset = res
+        out: dict[str, Any] = {"name": name, "offset": offset,
+                               "address": f"0x{address:x}"}
+        src = self.vm.source_location(address)
+        if src:
+            out["source"] = src
+        return out
+
+    def lookup_symbol(self, name: str) -> int | None:
+        """Resolve a symbol name to its address, or None if unknown."""
+        self._touch()
+        if not self._has_symbols:
+            raise NotImplementedError(
+                "Symbolization requires the extended Icicle binding (icicle_ext/)."
+            )
+        return self.vm.lookup_symbol(name)
+
+    def list_symbols(self) -> list[dict[str, Any]]:
+        """List loaded symbols as {address, size, name, kind}."""
+        self._touch()
+        if not self._has_symbols:
+            raise NotImplementedError(
+                "Symbolization requires the extended Icicle binding (icicle_ext/)."
+            )
+        return [{"address": f"0x{addr:x}", "size": size, "name": name, "kind": kind}
+                for addr, size, name, kind in self.vm.list_symbols()]
 
     # -- Linux userspace (extended binding) --
 

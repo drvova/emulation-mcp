@@ -264,6 +264,49 @@ impl icicle_cpu::mem::ReadHook for PyReadHook {
     }
 }
 
+/// An MMIO region whose reads and writes are *serviced* by Python callbacks,
+/// not backed by RAM. On read, `read_cb(addr, size)` supplies the value (as
+/// `bytes` of length `size`, or an int written little-endian); on write,
+/// `write_cb(addr, data: bytes)` observes the store. A missing callback means
+/// reads return zero / writes are dropped. Callbacks must not re-enter the VM.
+struct PyIoHandler {
+    read_cb: Option<PyObject>,
+    write_cb: Option<PyObject>,
+}
+
+impl icicle_cpu::mem::IoMemory for PyIoHandler {
+    fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        if let Some(cb) = &self.read_cb {
+            Python::attach(|py| {
+                if let Ok(ret) = cb.bind(py).call1((addr, buf.len())) {
+                    if let Ok(bytes) = ret.extract::<Vec<u8>>() {
+                        let n = bytes.len().min(buf.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                    } else if let Ok(v) = ret.extract::<u64>() {
+                        let le = v.to_le_bytes();
+                        let n = le.len().min(buf.len());
+                        buf[..n].copy_from_slice(&le[..n]);
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, addr: u64, value: &[u8]) -> Result<(), MemError> {
+        if let Some(cb) = &self.write_cb {
+            Python::attach(|py| {
+                let data = pyo3::types::PyBytes::new(py, value);
+                let _ = cb.bind(py).call1((addr, data));
+            });
+        }
+        Ok(())
+    }
+}
+
 #[pyclass(unsendable, module = "icicle")]
 pub struct Icicle {
     architecture: String,
@@ -273,6 +316,10 @@ pub struct Icicle {
     snapshots: Vec<icicle_vm::Snapshot>,
     // Set of basic-block addresses executed, when coverage is enabled.
     coverage: Option<Rc<RefCell<HashSet<u64>>>>,
+    // Compare-logging (RedQueen / input-to-state) instrumentation, when enabled.
+    cmplog: Option<icicle_fuzzing::cmplog2::CmpLog2Ref>,
+    // Symbol table / DWARF debug info loaded from one or more ELF files.
+    debug_info: Option<icicle_cpu::debug_info::DebugInfo>,
 }
 
 /// Map a core VmExit to the Python-facing RunStatus enum.
@@ -487,6 +534,8 @@ impl Icicle {
             regs,
             snapshots: Vec::new(),
             coverage: None,
+            cmplog: None,
+            debug_info: None,
         })
     }
 
@@ -738,6 +787,71 @@ impl Icicle {
         self.vm.get_disasm(address).map(|s| s.to_string())
     }
 
+    /// Lifted P-code (the SLEIGH intermediate language) for the block group that
+    /// begins at `address`, rendered as text with the original instructions
+    /// interleaved. Returns None if the address cannot be lifted. This is the
+    /// semantic IR the emulator actually executes — the basis for taint,
+    /// symbolic reasoning, and semantic diffing.
+    pub fn get_pcode(&mut self, address: u64) -> Option<String> {
+        let group = self.vm.lift(address).ok()?;
+        group
+            .to_string_with_disasm(
+                &self.vm.code.blocks,
+                &self.vm.cpu.arch.sleigh,
+                false,
+                &self.vm.code.disasm,
+            )
+            .ok()
+    }
+
+    // ---- Symbolization (ELF symbol table + DWARF) ----
+
+    /// Load the symbol table and DWARF line info from the ELF at `path`,
+    /// relocated by `load_address` (ignored for non-PIE/static executables).
+    /// Can be called more than once to merge symbols from several files.
+    /// Returns the number of symbols now known.
+    pub fn load_symbols(&mut self, path: String, load_address: u64) -> PyResult<usize> {
+        let data = std::fs::read(&path)
+            .map_err(|e| PyException::new_err(format!("Failed to read {path}: {e}")))?;
+        let mut info = self.debug_info.take().unwrap_or_default();
+        info.add_file(&data, load_address)
+            .map_err(|e| PyException::new_err(format!("Failed to load symbols: {e}")))?;
+        let count = info.symbols_iter().count();
+        self.debug_info = Some(info);
+        Ok(count)
+    }
+
+    /// Resolve an address to `(symbol_name, offset_from_symbol_start)`, or None
+    /// if no loaded symbol covers it. Requires `load_symbols` first.
+    pub fn symbolize(&self, addr: u64) -> Option<(String, u64)> {
+        let info = self.debug_info.as_ref()?;
+        let (name, start, _kind) = info.symbols.resolve_addr(addr)?;
+        Some((name.to_string(), addr - start))
+    }
+
+    /// Resolve a symbol name to its address, or None if unknown.
+    pub fn lookup_symbol(&self, name: &str) -> Option<u64> {
+        self.debug_info.as_ref()?.symbols.resolve_sym(name)
+    }
+
+    /// Every loaded symbol as `(address, size, name, kind)`.
+    pub fn list_symbols(&self) -> Vec<(u64, u64, String, String)> {
+        let mut out = Vec::new();
+        if let Some(info) = &self.debug_info {
+            for (addr, len, name, kind) in info.symbols_iter() {
+                out.push((addr, len, name.to_string(), format!("{kind:?}")));
+            }
+        }
+        out
+    }
+
+    /// Source location (`function` or `symbol+offset`, from DWARF when present)
+    /// for an address, or None. Requires `load_symbols` on a binary built with
+    /// debug info for file/line detail.
+    pub fn source_location(&self, addr: u64) -> Option<String> {
+        self.debug_info.as_ref()?.symbolize_addr(addr).and_then(|loc| loc.label())
+    }
+
     /// (start, size) pairs for every currently mapped memory range. Works for
     /// any session (including OS-loaded images), unlike wrapper-side region
     /// tracking which only knows about explicitly mapped regions.
@@ -832,6 +946,73 @@ impl Icicle {
         }
     }
 
+    // ---- Compare logging (RedQueen / input-to-state) ----
+
+    /// Instrument comparisons so that, during execution, the concrete operand
+    /// pairs seen at each compare are recorded. This is the input-to-state /
+    /// RedQueen primitive: it tells a fuzzer exactly which bytes a magic-value
+    /// or checksum check wants. `instrument_calls=True` also logs memcmp/strcmp
+    /// style call-argument comparisons. Install before running.
+    #[pyo3(signature = (instrument_calls = false))]
+    pub fn enable_cmplog(&mut self, instrument_calls: bool) {
+        let cmplog = icicle_fuzzing::cmplog2::CmpLog2Builder::new()
+            .instrument_calls(instrument_calls)
+            .finish(&mut self.vm);
+        cmplog.set_enabled(&mut self.vm.cpu, true);
+        self.cmplog = Some(cmplog);
+    }
+
+    /// Whether compare logging is currently installed.
+    pub fn cmplog_enabled(&self) -> bool {
+        self.cmplog.is_some()
+    }
+
+    /// Recorded instruction-compare operands: one `(address, kind, pairs)` entry
+    /// per instrumented compare site, where `pairs` is the list of `(lhs, rhs)`
+    /// values observed there (sign-extended). Empty unless `enable_cmplog` ran.
+    pub fn get_cmplog(&mut self) -> Vec<(u64, String, Vec<(i64, i64)>)> {
+        let mut out = Vec::new();
+        if let Some(cmplog) = &self.cmplog {
+            for entry in cmplog.get_inst_log(&mut self.vm.cpu) {
+                if entry.values.is_empty() {
+                    continue;
+                }
+                out.push((entry.addr, format!("{:?}", entry.op.kind), entry.values.clone()));
+            }
+        }
+        out
+    }
+
+    /// Recorded call-compare operands (memcmp/strcmp style), one
+    /// `(address, is_indirect, pairs)` entry per site; each pair is the two
+    /// compared byte buffers as hex. Only populated when `enable_cmplog` was
+    /// called with `instrument_calls=True`.
+    pub fn get_cmplog_calls(&mut self) -> Vec<(u64, bool, Vec<(String, String)>)> {
+        let mut out = Vec::new();
+        if let Some(cmplog) = &self.cmplog {
+            for entry in cmplog.get_call_log(&mut self.vm.cpu) {
+                if entry.values.is_empty() {
+                    continue;
+                }
+                let hex_of = |bytes: &[u8]| -> String {
+                    bytes.iter().map(|b| format!("{b:02x}")).collect()
+                };
+                let pairs = entry.values.iter()
+                    .map(|(a, b)| (hex_of(a), hex_of(b)))
+                    .collect();
+                out.push((entry.addr, entry.is_indirect, pairs));
+            }
+        }
+        out
+    }
+
+    /// Clear the recorded compare operands (instrumentation stays installed).
+    pub fn clear_cmplog(&mut self) {
+        if let Some(cmplog) = &self.cmplog {
+            cmplog.clear_data(&mut self.vm.cpu);
+        }
+    }
+
     // ---- Python-callback hooks (arbitrary instrumentation from the bottom) ----
 
     /// Call `callback(address)` from Python whenever `address` is executed.
@@ -887,6 +1068,27 @@ impl Icicle {
     /// Remove a read hook by the id returned from `add_mem_read_hook`.
     pub fn remove_mem_read_hook(&mut self, id: u32) -> bool {
         self.vm.cpu.mem.remove_read_hook(id)
+    }
+
+    // ---- MMIO: memory-mapped I/O serviced by Python callbacks ----
+
+    /// Map `[start, start+size)` as an MMIO region whose accesses are serviced
+    /// by Python, not backed by RAM. `read_cb(addr, size)` returns the value a
+    /// read sees (`bytes` of length `size`, or an int written little-endian);
+    /// `write_cb(addr, data: bytes)` is called on each write. Either callback
+    /// may be None (reads return zero / writes are dropped). Unlike a memory
+    /// watchpoint hook, the region has no storage — this models device
+    /// registers / peripherals. Returns True if the region was mapped.
+    #[pyo3(signature = (start, size, read_cb=None, write_cb=None))]
+    pub fn map_mmio(
+        &mut self,
+        start: u64,
+        size: u64,
+        read_cb: Option<PyObject>,
+        write_cb: Option<PyObject>,
+    ) -> bool {
+        let handler = self.vm.cpu.mem.register_io_handler(PyIoHandler { read_cb, write_cb });
+        self.vm.cpu.mem.map_memory_len(start, size, handler)
     }
 
     // ---- GDB remote stub ----

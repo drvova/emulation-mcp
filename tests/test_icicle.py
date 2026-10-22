@@ -493,6 +493,157 @@ class TestIcicleMemoryHooks(unittest.TestCase):
         eng.close()
 
 
+@unittest.skipUnless(HAS_ICICLE and "pcode_il" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIciclePcode(unittest.TestCase):
+    def test_pcode_lift(self):
+        eng = IcicleEngine(arch="x86_64")
+        # mov eax, 1 ; add eax, 2
+        eng.memory_write(CODE_BASE, bytes.fromhex("b801000000" "83c002"))
+        text = eng.get_pcode(CODE_BASE)
+        # The IL carries the disassembly plus the micro-ops it expands to.
+        self.assertIn("MOV", text.upper())
+        self.assertIn("RAX", text)      # the p-code writes the full 64-bit reg
+        self.assertIn("ADD", text.upper())
+        eng.close()
+
+    def test_pcode_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("pcode_il", eng.CAPABILITIES)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "mmio" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleMmio(unittest.TestCase):
+    # disp32 with the high bit clear (0x40000000) so x86-64 does not
+    # sign-extend the displacement.
+    MMIO = 0x40000000
+
+    def test_mmio_read_and_write_serviced(self):
+        eng = IcicleEngine(arch="x86_64")
+        writes = []
+        eng.map_mmio(self.MMIO, 0x1000,
+                     read_cb=lambda a, s: 0x11223344,
+                     write_cb=lambda a, d: writes.append((a, bytes(d))))
+        # mov eax, [MMIO] ; mov [MMIO+4], eax
+        eng.memory_write(CODE_BASE, bytes.fromhex("8b042500000040" "89042504000040"))
+        eng.register_write("rip", CODE_BASE)
+        eng.step(1)
+        self.assertEqual(eng.register_read("rax"), 0x11223344)   # read serviced
+        eng.step(1)
+        self.assertEqual(writes, [(self.MMIO + 4, b"\x44\x33\x22\x11")])  # write serviced (LE)
+        eng.close()
+
+    def test_mmio_default_read_zero(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.map_mmio(self.MMIO, 0x1000)  # no callbacks
+        eng.register_write("rax", 0xdead)
+        eng.memory_write(CODE_BASE, bytes.fromhex("8b042500000040"))  # mov eax,[MMIO]
+        eng.register_write("rip", CODE_BASE)
+        eng.step(1)
+        self.assertEqual(eng.register_read("rax"), 0)  # unbacked read -> zero
+        eng.close()
+
+    def test_mmio_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("mmio", eng.CAPABILITIES)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "cmplog" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleCmplog(unittest.TestCase):
+    def test_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("cmplog", eng.CAPABILITIES)
+        eng.close()
+
+    def test_records_operands(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.enable_cmplog()
+        # cmp eax, 0x1337cafe ; jne +3 ; nop*3 ; nop ; hlt  (rax set at runtime
+        # so the compare is not statically constant and is therefore recorded)
+        eng.memory_write(CODE_BASE, bytes.fromhex("3dfeca3713" "7503" "909090" "90" "f4"))
+        eng.register_write("rax", 0x41414141)
+        eng.vm.icount_limit = 20
+        eng.register_write("rip", CODE_BASE)
+        eng.start(CODE_BASE)
+        log = eng.get_cmplog()
+        self.assertEqual(len(log), 1, log)
+        self.assertEqual(log[0]["address"], f"0x{CODE_BASE:x}")
+        self.assertIn([0x41414141, 0x1337cafe], log[0]["operands"])
+        eng.clear_cmplog()
+        self.assertEqual(eng.get_cmplog(), [])
+        eng.close()
+
+    def test_static_compare_dropped(self):
+        # Both operands statically constant in the block -> uninteresting -> dropped.
+        eng = IcicleEngine(arch="x86_64")
+        eng.enable_cmplog()
+        eng.memory_write(CODE_BASE, bytes.fromhex("b841414141" "3dfeca3713" "7503" "909090" "90" "f4"))
+        eng.vm.icount_limit = 20
+        eng.register_write("rip", CODE_BASE)
+        eng.start(CODE_BASE)
+        self.assertEqual(eng.get_cmplog(), [])
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "symbols" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleSymbols(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import shutil, subprocess, tempfile
+        cls.bin = None
+        if shutil.which("gcc") is None:
+            return
+        d = tempfile.mkdtemp()
+        src, out = os.path.join(d, "s.c"), os.path.join(d, "s")
+        with open(src, "w") as f:
+            f.write("int my_secret_func(int a){return a*3+1;}\n"
+                    "int main(void){return my_secret_func(7);}\n")
+        try:
+            subprocess.run(["gcc", "-static", "-no-pie", "-g", "-O0", "-o", out, src],
+                           check=True, capture_output=True, timeout=60)
+            cls.bin = out
+        except Exception:
+            cls.bin = None
+
+    def setUp(self):
+        if self.bin is None:
+            self.skipTest("gcc unavailable / build failed")
+
+    def test_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("symbols", eng.CAPABILITIES)
+        eng.close()
+
+    def test_round_trip(self):
+        eng = IcicleEngine(arch="x86_64")
+        n = eng.load_symbols(self.bin, 0)
+        self.assertGreater(n, 0)
+        addr = eng.lookup_symbol("my_secret_func")
+        self.assertIsNotNone(addr)
+        sym = eng.symbolize(addr)
+        self.assertEqual(sym["name"], "my_secret_func")
+        self.assertEqual(sym["offset"], 0)
+        # Offset tracking: an address inside the function resolves with offset.
+        mid = eng.symbolize(addr + 4)
+        self.assertEqual(mid["name"], "my_secret_func")
+        self.assertEqual(mid["offset"], 4)
+        eng.close()
+
+    def test_list_and_missing(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.load_symbols(self.bin, 0)
+        names = {s["name"] for s in eng.list_symbols()}
+        self.assertIn("main", names)
+        self.assertIn("my_secret_func", names)
+        self.assertIsNone(eng.lookup_symbol("definitely_not_a_symbol"))
+        eng.close()
+
+
 @unittest.skipUnless(HAS_ICICLE and "wide_registers" in EXT_CAPS,
                      "extended Icicle binding (icicle_ext/) not installed")
 class TestIcicleWideRegisters(unittest.TestCase):
