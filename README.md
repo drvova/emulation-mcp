@@ -102,6 +102,10 @@ show which are active).
   no-ops bytes, so exploration skips checksums/libc/irrelevant code
 - **Decompiler** — `emu_decompile` lifts a function to pseudo-C; `emu_function_info`
   reports its flags (returning/PLT/syscall), block count, callers and callees
+- **Data-flow analyses** — `emu_reaching_definitions`, `emu_data_dependencies`
+  (data-dependence graph) and `emu_backward_slice` (which blocks a target
+  instruction depends on). Scoped per-function so they stay tractable in large
+  binaries
 - `emu_cfg` recovers a control-flow graph and lists functions; `emu_call_function`
   runs a function with concrete args (calling-convention aware) and returns the result
 - **Fine-grained event inspection** — `engine.add_inspect_hook(event, fn)` (via
@@ -131,6 +135,7 @@ show which are active).
 | snapshots           |   ✓     |   ✓    |   ✓    |  ✓   |
 | symbolic execution  |         |        |        |  ✓   |
 | constraints / solver|         |        |        |  ✓   |
+| data-flow analyses  |         |        |        |  ✓   |
 | CFG / functions     |         |        |        |  ✓   |
 | function calls      |         |        |        |  ✓   |
 | decompiler          |         |        |        |  ✓   |

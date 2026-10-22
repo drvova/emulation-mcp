@@ -90,7 +90,7 @@ class AngrEngine(BaseEngine):
         "shellcode", "binary_loading", "address_hooks",
         "instruction_trace", "snapshots", "symbolic",
         "cfg", "function_call", "decompiler", "constraints",
-        "inspection", "sim_procedures",
+        "inspection", "sim_procedures", "dataflow",
     })
 
     # state.inspect events we accept for add_inspect_hook.
@@ -932,6 +932,105 @@ class AngrEngine(BaseEngine):
         if proto is not None:
             info["prototype"] = str(proto)
         return info
+
+    # -- Data-flow analyses (angr-specific) --
+
+    def _scoped_emulated_cfg(self, func_addr: int, call_depth: int = 0):
+        """Build a CFGEmulated scoped to one function.
+
+        starts at the function and (with call_depth=0) does not descend into
+        callees, which keeps the emulation bounded even inside a large binary.
+        """
+        return self.proj.analyses.CFGEmulated(
+            keep_state=True,
+            state_add_options=angr.sim_options.refs,
+            starts=[self._clean_addr(func_addr)],
+            call_depth=call_depth,
+            context_sensitivity_level=1,
+            normalize=True,
+        )
+
+    def reaching_definitions(self, function_addr: int) -> dict[str, Any]:
+        """Summarize reaching definitions (register/memory writes) in a function."""
+        self._touch()
+        try:
+            self._ensure_cfg()
+        except Exception as e:
+            return {"error": f"CFG recovery failed: {type(e).__name__}: {e}"}
+        fn = self._lookup_function(function_addr)
+        if fn is None:
+            return {"error": f"No function recovered at 0x{function_addr:x}."}
+        try:
+            rd = self.proj.analyses.ReachingDefinitions(
+                subject=fn, func_graph=fn.graph, observe_all=True)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        from collections import Counter
+        defs = list(rd.all_definitions)
+        kinds = Counter(type(d.atom).__name__ for d in defs)
+        return {
+            "address": f"0x{fn.addr:x}", "name": fn.name,
+            "definitions": len(defs), "by_kind": dict(kinds),
+        }
+
+    def data_dependencies(self, function_addr: int, call_depth: int = 0) -> dict[str, Any]:
+        """Summarize the data-dependence graph (DDG) of a function."""
+        self._touch()
+        try:
+            self._ensure_cfg()
+        except Exception as e:
+            return {"error": f"CFG recovery failed: {type(e).__name__}: {e}"}
+        fn = self._lookup_function(function_addr)
+        if fn is None:
+            return {"error": f"No function recovered at 0x{function_addr:x}."}
+        try:
+            ec = self._scoped_emulated_cfg(fn.addr, call_depth)
+            ddg = self.proj.analyses.DDG(ec, start=fn.addr)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        return {
+            "address": f"0x{fn.addr:x}", "name": fn.name,
+            "nodes": ddg.graph.number_of_nodes(),
+            "edges": ddg.graph.number_of_edges(),
+        }
+
+    def backward_slice(self, target_addr: int, call_depth: int = 0) -> dict[str, Any]:
+        """Backward program slice: the blocks whose data/control the target depends on.
+
+        Scopes the analysis to the function containing `target_addr` (bounded by
+        call_depth), so it is practical even inside a large binary. Returns the
+        set of block addresses in the slice.
+        """
+        self._touch()
+        try:
+            self._ensure_cfg()
+        except Exception as e:
+            return {"error": f"CFG recovery failed: {type(e).__name__}: {e}"}
+        target = self._clean_addr(target_addr)
+        fn = self.proj.kb.functions.floor_func(target) if hasattr(
+            self.proj.kb.functions, "floor_func") else self._lookup_function(target)
+        if fn is None:
+            return {"error": f"No function contains 0x{target:x}."}
+        try:
+            ec = self._scoped_emulated_cfg(fn.addr, call_depth)
+            cdg = self.proj.analyses.CDG(ec, start=fn.addr)
+            ddg = self.proj.analyses.DDG(ec, start=fn.addr)
+            node = ec.model.get_any_node(target, anyaddr=True)
+            if node is None:
+                return {"error": f"0x{target:x} is not in the emulated CFG of "
+                                 f"{fn.name} (try an instruction inside the function)."}
+            bs = self.proj.analyses.BackwardSlice(ec, cdg=cdg, ddg=ddg, targets=[(node, -1)])
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        chosen = getattr(bs, "chosen_statements", {}) or {}
+        blocks = sorted(f"0x{a:x}" for a in chosen)
+        return {
+            "function": f"0x{fn.addr:x}", "name": fn.name,
+            "target": f"0x{target:x}",
+            "slice_blocks": blocks[:64],
+            "block_count": len(blocks),
+            "statement_count": sum(len(v) for v in chosen.values()),
+        }
 
     # -- Lifecycle --
 

@@ -21,9 +21,12 @@ except ImportError:
 
 try:
     import angr  # noqa: F401
+    from tests.test_angr import build_freestanding
     HAS_ANGR = True
-except ImportError:
+    _ANGR_FREE = build_freestanding()
+except Exception:
     HAS_ANGR = False
+    _ANGR_FREE = None
 
 try:
     import qiling  # noqa: F401
@@ -605,6 +608,33 @@ class TestAngrThroughServer(unittest.TestCase):
         try:
             out = _fn(server.emu_list_sessions)()
             self.assertIn(sid, out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_dataflow_via_server(self):
+        if _ANGR_FREE is None:
+            self.skipTest("gcc (for a freestanding binary) unavailable")
+        sid = _new_session(engine="angr", binary_path=_ANGR_FREE)
+        try:
+            cfg = _fn(server.emu_cfg)(sid, True, 500)
+            import re
+            funcs = {}
+            for line in cfg.splitlines()[1:]:
+                m = re.match(r"\s*(0x[0-9a-f]+)\s+(\S+)", line)
+                if m:
+                    funcs[m.group(2)] = m.group(1)
+            comp = funcs["compute"]
+            self.assertIn("reaching definitions", _fn(server.emu_reaching_definitions)(sid, comp))
+            self.assertIn("data-dependence graph", _fn(server.emu_data_dependencies)(sid, comp))
+            self.assertIn("Backward slice", _fn(server.emu_backward_slice)(sid, comp))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_dataflow_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_reaching_definitions)(sid, "0x1000000"))
+            self.assertIn("not supported", _fn(server.emu_backward_slice)(sid, "0x1000000"))
         finally:
             _fn(server.emu_close_session)(sid)
 

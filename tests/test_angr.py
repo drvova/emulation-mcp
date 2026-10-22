@@ -365,6 +365,91 @@ class TestAngrDecompiler(unittest.TestCase):
         eng.close()
 
 
+# A freestanding (no-libc) binary keeps angr's heavy emulated analyses (DDG/CDG/
+# backward slice) tractable; built once, gated on gcc.
+_FREESTANDING_SRC = (
+    'static long _x(int c){long r;__asm__ volatile("syscall":"=a"(r):"a"(60),"D"(c)'
+    ':"rcx","r11","memory");return r;}\n'
+    'int compute(int a,int b){int s=a+b;if(s==12)return s*2;return s;}\n'
+    'void _start(void){int r=compute(5,7);_x(r);}\n'
+)
+_free_bin_cache = {}
+
+
+def build_freestanding():
+    import shutil, subprocess, tempfile
+    if "p" in _free_bin_cache:
+        return _free_bin_cache["p"]
+    p = None
+    if shutil.which("gcc") is not None:
+        d = tempfile.mkdtemp(prefix="angr_free_")
+        src, out = os.path.join(d, "f.c"), os.path.join(d, "f")
+        with open(src, "w") as f:
+            f.write(_FREESTANDING_SRC)
+        try:
+            subprocess.run(["gcc", "-nostdlib", "-static", "-O0", "-o", out, src],
+                           check=True, capture_output=True, timeout=60)
+            p = out
+        except Exception:
+            p = None
+    _free_bin_cache["p"] = p
+    return p
+
+
+HAS_FREESTANDING = HAS_ANGR and build_freestanding() is not None
+
+
+@unittest.skipUnless(HAS_FREESTANDING, "angr or gcc (for a freestanding binary) not available")
+class TestAngrDataflow(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bin = build_freestanding()
+
+    def _loaded(self):
+        eng = AngrEngine(binary_path=self.bin)
+        cfg = eng.recover_cfg(fast=True)
+        byname = {f["name"]: int(f["address"], 16) for f in cfg["functions"]}
+        return eng, byname
+
+    def test_capability(self):
+        eng = AngrEngine(binary_path=self.bin)
+        self.assertIn("dataflow", eng.CAPABILITIES)
+        eng.close()
+
+    def test_reaching_definitions(self):
+        eng, byname = self._loaded()
+        r = eng.reaching_definitions(byname["compute"])
+        self.assertNotIn("error", r, r)
+        self.assertGreater(r["definitions"], 0)
+        self.assertIn("Register", r["by_kind"])
+        eng.close()
+
+    def test_data_dependencies(self):
+        eng, byname = self._loaded()
+        r = eng.data_dependencies(byname["compute"])
+        self.assertNotIn("error", r, r)
+        self.assertGreater(r["nodes"], 0)
+        eng.close()
+
+    def test_backward_slice_nonempty_somewhere(self):
+        eng, byname = self._loaded()
+        fn = eng.proj.kb.functions.get_by_addr(byname["compute"])
+        # Some target in the function must yield a non-empty slice.
+        best = 0
+        for baddr in sorted(fn.block_addrs):
+            r = eng.backward_slice(baddr)
+            self.assertNotIn("error", r, r)
+            best = max(best, r["block_count"])
+        self.assertGreater(best, 0, "no block produced a non-empty backward slice")
+        eng.close()
+
+    def test_dataflow_missing_function(self):
+        eng = AngrEngine(binary_path=self.bin)
+        eng.recover_cfg(fast=True)
+        self.assertIn("error", eng.reaching_definitions(0xdeadbeef))
+        eng.close()
+
+
 if __name__ == "__main__":
     if not HAS_ANGR:
         print("angr not installed; skipping angr engine tests")

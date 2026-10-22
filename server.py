@@ -2742,6 +2742,90 @@ def emu_function_info(session_id: str, address: str) -> str:
 
 
 @mcp.tool()
+def emu_reaching_definitions(session_id: str, address: str) -> str:
+    """Summarize a function's reaching definitions ('dataflow' capability, angr).
+
+    Reports how many register/memory definitions (writes that can be observed
+    downstream) the function makes, broken down by kind.
+
+    session_id: Active angr session.
+    address: Hex address of the function.
+    """
+    try:
+        engine = sessions.get(session_id)
+        r = engine.reaching_definitions(_parse_addr(address))
+        if "error" in r:
+            return f"Error: {r['error']}"
+        kinds = ", ".join(f"{k}={v}" for k, v in r["by_kind"].items()) or "(none)"
+        return (f"{r['name']} @ {r['address']}: {r['definitions']} reaching "
+                f"definitions ({kinds})")
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Reaching definitions error: {e}"
+
+
+@mcp.tool()
+def emu_data_dependencies(session_id: str, address: str, call_depth: int = 0) -> str:
+    """Summarize a function's data-dependence graph ('dataflow' capability, angr).
+
+    Builds a data-dependence graph (DDG) over the function and reports its size.
+    Scoped to the one function (call_depth=0 does not descend into callees), so it
+    stays tractable inside large binaries.
+
+    session_id: Active angr session.
+    address: Hex address of the function.
+    call_depth: How many levels of callees to include (default 0).
+    """
+    try:
+        engine = sessions.get(session_id)
+        r = engine.data_dependencies(_parse_addr(address), call_depth)
+        if "error" in r:
+            return f"Error: {r['error']}"
+        return (f"{r['name']} @ {r['address']}: data-dependence graph has "
+                f"{r['nodes']} nodes, {r['edges']} edges")
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Data dependencies error: {e}"
+
+
+@mcp.tool()
+def emu_backward_slice(session_id: str, address: str, call_depth: int = 0) -> str:
+    """Backward program slice to an instruction ('dataflow' capability, angr).
+
+    Returns the set of basic blocks whose data or control flow the target
+    instruction depends on. Scoped to the function containing `address`.
+    A target with no predecessors (e.g. a function's first instruction) slices
+    to nothing — point it at an instruction of interest downstream.
+
+    session_id: Active angr session.
+    address: Hex address of the instruction to slice back from.
+    call_depth: How many levels of callees to include (default 0).
+    """
+    try:
+        engine = sessions.get(session_id)
+        r = engine.backward_slice(_parse_addr(address), call_depth)
+        if "error" in r:
+            return f"Error: {r['error']}"
+        head = ", ".join(r["slice_blocks"][:16])
+        more = f" (+{r['block_count'] - 16} more)" if r["block_count"] > 16 else ""
+        return (f"Backward slice to {r['target']} in {r['name']}: "
+                f"{r['block_count']} blocks, {r['statement_count']} statements\n"
+                f"  blocks: {head}{more}")
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Backward slice error: {e}"
+
+
+@mcp.tool()
 def emu_constrain(session_id: str, variable: str, op: str, value: str) -> str:
     """Add a constraint on a symbolic variable ('constraints' capability, angr).
 

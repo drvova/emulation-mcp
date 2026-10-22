@@ -84,6 +84,7 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "cfg": "Recover a control-flow graph and list functions",
     "function_call": "Execute a function with concrete args (calling-convention aware)",
     "decompiler": "Decompile a function to pseudo-C",
+    "dataflow": "Data-flow analyses: reaching definitions, data dependence, backward slicing",
     "constraints": "Add solver constraints and query value ranges/satisfiability",
     "inspection": "Register callbacks on fine-grained events (mem/reg/instruction breakpoints)",
     "sim_procedures": "Replace or skip functions with Python stubs (SimProcedures)",
@@ -264,6 +265,18 @@ class BaseEngine(ABC):
     def function_info(self, address: int) -> dict[str, Any]:
         """Return metadata about one recovered function. 'cfg' capability."""
         raise NotImplementedError(f"Function info is not supported by the '{self.engine_type}' engine")
+
+    def reaching_definitions(self, function_addr: int) -> dict[str, Any]:
+        """Summarize reaching definitions for a function. 'dataflow' capability."""
+        raise NotImplementedError(f"Data-flow analysis is not supported by the '{self.engine_type}' engine")
+
+    def data_dependencies(self, function_addr: int, call_depth: int = 0) -> dict[str, Any]:
+        """Summarize the data-dependence graph of a function. 'dataflow' capability."""
+        raise NotImplementedError(f"Data-flow analysis is not supported by the '{self.engine_type}' engine")
+
+    def backward_slice(self, target_addr: int, call_depth: int = 0) -> dict[str, Any]:
+        """Backward program slice to an instruction. 'dataflow' capability."""
+        raise NotImplementedError(f"Backward slicing is not supported by the '{self.engine_type}' engine")
 
     def add_constraint(self, var_name: str, op: str, value: int) -> dict[str, Any]:
         """Constrain a symbolic variable (op in ==,!=,<,<=,>,>=). 'constraints'."""
