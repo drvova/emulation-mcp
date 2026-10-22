@@ -170,6 +170,24 @@ show which are active).
 
 † Icicle feature available with the extended binding (`icicle_ext/`); see below.
 
+### Known boundaries
+
+Each engine's common reverse-engineering surface is wired in. A few specialist
+corners are reachable only with extra setup, or deliberately left to the
+framework:
+
+- **Qiling non-Linux targets** (Windows/UEFI/DOS/macOS/FreeBSD) are accepted via
+  `ostype`, but need a matching rootfs you supply (e.g. Windows DLLs); only Linux
+  is exercised by the bundled tests.
+- **angr concrete/symbolic (`Symbion`)** needs an external concrete executor
+  (a real process via `avatar2`/gdb) that isn't part of this server; use
+  `emu_call`/`emu_eval` to drive it if you have one attached.
+- **Icicle JIT internals and the native AFL trace format** have no useful Python
+  mapping (the server ships its own `emu_fuzz` loop); see `icicle_ext/README.md`.
+
+Anything not yet a first-class tool is still reachable through the reflective
+tools (`emu_describe` / `emu_call` / `emu_eval`, below).
+
 ## Requirements
 
 - Python 3.10+

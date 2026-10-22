@@ -57,3 +57,20 @@ the pinned commit and re-apply the same additions.
   their interpreter and libraries reachable under `sysroot`.
 - Execution is still bounded by the instruction budget / wall-clock timeout in
   the engine wrapper.
+
+## What is deliberately not exposed
+
+A few Icicle subsystems are left out because they have no useful Python mapping
+for this server, not because they were missed:
+
+- **The JIT backend internals** (`icicle-jit`). The binding selects the JIT vs.
+  interpreter via the `jit` constructor knob and otherwise treats compilation as
+  an implementation detail; there is nothing to drive from Python.
+- **The native fuzzing/AFL trace format** (`afl-icicle-trace`,
+  `icicle-fuzzing`). The server ships its own coverage-guided loop (`emu_fuzz`,
+  `fuzzing.py`) built on the exposed block-coverage and snapshot primitives, so
+  the on-disk AFL trace format is not surfaced.
+
+Everything with a sensible Python surface — VM/CPU/MMU, snapshots, reverse
+execution, disassembly, call stack, coverage, GDB, Linux userspace, and the
+instruction/block/memory hooks — is reachable through the wrapper or `emu_eval`.
