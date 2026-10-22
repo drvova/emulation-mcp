@@ -1682,6 +1682,54 @@ def emu_list_registers(session_id: str) -> str:
         return f"List registers error: {e}"
 
 
+@mcp.tool()
+def emu_register_read_wide(session_id: str, name: str) -> str:
+    """Read a register wider than 64 bits as raw bytes ('wide_registers').
+
+    For vector/flag aggregate registers (XMM/YMM/ZMM, ...) that don't fit in an
+    integer. Returns little-endian hex.
+
+    session_id: Active session ID.
+    name: Register name (e.g. "xmm0").
+    """
+    try:
+        engine = sessions.get(session_id)
+        data = engine.register_read_bytes(name)
+        return f"{name} = {data.hex()} ({len(data)} bytes, little-endian)"
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Wide register read error: {e}"
+
+
+@mcp.tool()
+def emu_register_write_wide(session_id: str, name: str, data_hex: str) -> str:
+    """Write raw bytes to a register wider than 64 bits ('wide_registers').
+
+    session_id: Active session ID.
+    name: Register name (e.g. "xmm0").
+    data_hex: Little-endian hex bytes (padded/truncated to the register width).
+    """
+    try:
+        engine = sessions.get(session_id)
+        clean = data_hex.replace(" ", "")
+        if clean.lower().startswith("0x"):
+            clean = clean[2:]
+        data = bytes.fromhex(clean)
+        if not data:
+            return "Error: data must not be empty."
+        engine.register_write_bytes(name, data)
+        return f"Wrote {len(data)} bytes to {name}."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Wide register write error: {e}"
+
+
 # ===========================================================================
 # Reverse execution, introspection & Linux mode (extended Icicle binding)
 # ===========================================================================
@@ -2332,6 +2380,8 @@ def emu_explore(
     avoid: list[str] | None = None,
     timeout_ms: int = 30000,
     num_find: int = 1,
+    techniques: list[str] | None = None,
+    veritesting: bool = False,
 ) -> str:
     """Symbolically explore paths to a target address (angr sessions only).
 
@@ -2340,6 +2390,10 @@ def emu_explore(
     avoid: Optional hex addresses to avoid.
     timeout_ms: Wall-clock budget for the search (default 30000).
     num_find: Number of distinct solutions to collect (default 1).
+    techniques: Optional exploration techniques to attach, e.g.
+      ["dfs", "loopseer:128", "lengthlimiter:2000", "oppologist"].
+    veritesting: Enable Veritesting (static merging of paths) to tame path
+      explosion.
 
     Returns the solved values for every symbolic variable on each found path.
     """
@@ -2352,7 +2406,9 @@ def emu_explore(
             return "Error: at least one 'find' address is required."
         find_addrs = [_parse_addr(a) for a in find]
         avoid_addrs = [_parse_addr(a) for a in (avoid or [])]
-        result = engine.explore(find_addrs, avoid_addrs, timeout_ms=timeout_ms, num_find=num_find)
+        result = engine.explore(find_addrs, avoid_addrs, timeout_ms=timeout_ms,
+                                num_find=num_find, techniques=techniques,
+                                veritesting=veritesting)
 
         lines = [f"Exploration: {result['status']}"]
         lines.append(f"  found={result.get('found', 0)} avoided={result.get('avoided', 0)} "
@@ -2406,6 +2462,67 @@ def emu_solve(session_id: str, variable: str, count: int = 1) -> str:
         return str(e)
     except Exception as e:
         return f"Solve error: {e}"
+
+
+@mcp.tool()
+def emu_cfg(session_id: str, fast: bool = True, limit: int = 100) -> str:
+    """Recover a control-flow graph and list functions ('cfg' capability, angr).
+
+    session_id: Active session ID.
+    fast: Use CFGFast (quick, default) vs. CFGEmulated (precise, slower).
+    limit: Max functions to list.
+    """
+    try:
+        engine = sessions.get(session_id)
+        result = engine.recover_cfg(fast=fast)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        funcs = result["functions"]
+        lines = [f"CFG: {result['nodes']} nodes, {result['edges']} edges, "
+                 f"{len(funcs)} functions."]
+        for f in funcs[:limit]:
+            plt = " [plt]" if f.get("is_plt") else ""
+            lines.append(f"  {f['address']} {f['name']} (size {f['size']}){plt}")
+        if len(funcs) > limit:
+            lines.append(f"  ... and {len(funcs) - limit} more")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"CFG error: {e}"
+
+
+@mcp.tool()
+def emu_call_function(session_id: str, address: str, args: list[str] | None = None) -> str:
+    """Execute a function with concrete integer args ('function_call', angr).
+
+    Uses angr's calling-convention-aware `callable`, so you pass arguments by
+    value and get the return value, without setting up registers/stack yourself.
+
+    session_id: Active session ID.
+    address: Hex address of the function.
+    args: Integer arguments (decimal or hex strings).
+    """
+    try:
+        engine = sessions.get(session_id)
+        addr = _parse_addr(address)
+        call_args = [_parse_addr(a) for a in (args or [])]
+        result = engine.call_function(addr, call_args)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        rv = result["return_value"]
+        if rv is None:
+            return f"Called {result['address']}({', '.join(map(str, call_args))}) -> (void/unknown)"
+        return (f"Called {result['address']}({', '.join(hex(a) for a in call_args)}) "
+                f"-> {rv['hex']} ({rv['int']})")
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Call function error: {e}"
 
 
 # ===========================================================================

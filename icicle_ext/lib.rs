@@ -565,6 +565,30 @@ impl Icicle {
         Ok(self.vm.cpu.read_reg(reg_var(self, name)?))
     }
 
+    /// Read a register's full backing bytes (little-endian), for registers
+    /// wider than 64 bits (e.g. XMM/YMM/ZMM, vector and flag aggregates).
+    pub fn reg_read_bytes(&mut self, name: &str) -> PyResult<Cow<'_, [u8]>> {
+        let var = reg_var(self, name)?;
+        match self.vm.cpu.regs.get(var) {
+            Some(bytes) => Ok(Cow::Owned(bytes.to_vec())),
+            None => Err(PyKeyError::new_err(format!("Register has no backing bytes: {name}"))),
+        }
+    }
+
+    /// Write a register's full backing bytes (little-endian). Extra bytes are
+    /// ignored; a short buffer leaves the remaining bytes unchanged.
+    pub fn reg_write_bytes(&mut self, name: &str, data: Vec<u8>) -> PyResult<()> {
+        let var = reg_var(self, name)?;
+        match self.vm.cpu.regs.get_mut(var) {
+            Some(dst) => {
+                let n = dst.len().min(data.len());
+                dst[..n].copy_from_slice(&data[..n]);
+                Ok(())
+            }
+            None => Err(PyKeyError::new_err(format!("Register has no backing bytes: {name}"))),
+        }
+    }
+
     pub fn reg_write(&mut self, name: &str, value: u64) -> PyResult<()> {
         let var = reg_var(self, name)?;
         if var == self.vm.cpu.arch.reg_pc {
@@ -777,6 +801,34 @@ impl Icicle {
         if let Some(set) = &self.coverage {
             set.borrow_mut().clear();
         }
+    }
+
+    // ---- Python-callback hooks (arbitrary instrumentation from the bottom) ----
+
+    /// Call `callback(address)` from Python whenever `address` is executed.
+    /// Install before running (hooks are injected as blocks are lifted). The
+    /// callback is observe-only: it must not call back into this engine (the VM
+    /// is borrowed for the duration of the run).
+    pub fn add_py_hook(&mut self, address: u64, callback: PyObject) {
+        let cb = callback;
+        self.vm.hook_address(address, move |_cpu: &mut Cpu, addr: u64| {
+            Python::attach(|py| {
+                let _ = cb.bind(py).call1((addr,));
+            });
+        });
+    }
+
+    /// Call `callback(block_start_address)` from Python on every basic-block
+    /// entry. This is the general instrumentation primitive (custom coverage,
+    /// tracing, taint, ...). Same observe-only / install-before-running rules.
+    pub fn add_py_block_hook(&mut self, callback: PyObject) {
+        let cb = callback;
+        let hook = self.vm.cpu.add_hook(Box::new(move |_cpu: &mut Cpu, addr: u64| {
+            Python::attach(|py| {
+                let _ = cb.bind(py).call1((addr,));
+            });
+        }));
+        icicle_vm::injector::register_block_hook_injector(&mut self.vm, 0, u64::MAX, hook);
     }
 
     // ---- GDB remote stub ----

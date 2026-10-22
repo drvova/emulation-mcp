@@ -81,6 +81,10 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "disassembly": "Disassemble using the engine's own instruction semantics",
     "coverage": "Record the set of basic blocks executed (for fuzzing/triage)",
     "gdb": "Serve a GDB remote stub so a real debugger can attach",
+    "cfg": "Recover a control-flow graph and list functions",
+    "function_call": "Execute a function with concrete args (calling-convention aware)",
+    "callback_hooks": "Register Python callbacks that fire during emulation",
+    "wide_registers": "Read/write registers wider than 64 bits (vector/flag aggregates)",
 }
 
 
@@ -233,6 +237,30 @@ class BaseEngine(ABC):
     def gdb_serve(self, address: str = "127.0.0.1:1234", timeout_secs: int = 30) -> str:
         """Serve a GDB remote stub for a debugger to attach. 'gdb' capability."""
         raise NotImplementedError(f"A GDB stub is not supported by the '{self.engine_type}' engine")
+
+    def recover_cfg(self, fast: bool = True) -> dict[str, Any]:
+        """Recover a control-flow graph and list functions. 'cfg' capability."""
+        raise NotImplementedError(f"CFG recovery is not supported by the '{self.engine_type}' engine")
+
+    def list_functions(self) -> list[dict[str, Any]]:
+        """List recovered functions. 'cfg' capability."""
+        raise NotImplementedError(f"Function listing is not supported by the '{self.engine_type}' engine")
+
+    def call_function(self, address: int, args: list[int] | None = None) -> dict[str, Any]:
+        """Execute a function with concrete args. 'function_call' capability."""
+        raise NotImplementedError(f"Function calls are not supported by the '{self.engine_type}' engine")
+
+    def add_callback_hook(self, callback: Callable, address: int | None = None) -> str:
+        """Register a Python callback fired during emulation. 'callback_hooks'."""
+        raise NotImplementedError(f"Callback hooks are not supported by the '{self.engine_type}' engine")
+
+    def register_read_bytes(self, name: str) -> bytes:
+        """Read a register's full backing bytes (wide registers). 'wide_registers'."""
+        raise NotImplementedError(f"Wide-register access is not supported by the '{self.engine_type}' engine")
+
+    def register_write_bytes(self, name: str, data: bytes) -> None:
+        """Write a register's full backing bytes (wide registers). 'wide_registers'."""
+        raise NotImplementedError(f"Wide-register access is not supported by the '{self.engine_type}' engine")
 
     def hook_remove(self, hook_id: str) -> bool:
         """Remove a hook by ID. Returns True if removed."""

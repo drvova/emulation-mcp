@@ -406,6 +406,39 @@ class TestIcicleCoverage(unittest.TestCase):
         eng.close()
 
 
+@unittest.skipUnless(HAS_ICICLE and "callback_hooks" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleCallbackHooks(unittest.TestCase):
+    def test_block_callback(self):
+        eng = IcicleEngine(arch="x86_64")
+        hits = []
+        eng.add_callback_hook(lambda a: hits.append(a))  # every basic block
+        eng.memory_write(CODE_BASE, bytes.fromhex("b801000000" "85c0" "7401" "90" "90"))
+        eng.start(CODE_BASE, CODE_BASE + 11)
+        self.assertIn(CODE_BASE, hits)
+        self.assertGreaterEqual(len(hits), 2, hits)
+        eng.close()
+
+    def test_address_callback(self):
+        eng = IcicleEngine(arch="x86_64")
+        hits = []
+        eng.add_callback_hook(lambda a: hits.append(a), address=CODE_BASE + 5)
+        eng.memory_write(CODE_BASE, bytes.fromhex("90" * 10))
+        eng.start(CODE_BASE, CODE_BASE + 10)
+        self.assertEqual(hits, [CODE_BASE + 5])
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "wide_registers" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleWideRegisters(unittest.TestCase):
+    def test_xmm_roundtrip(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.register_write_bytes("xmm0", bytes(range(16)))
+        self.assertEqual(eng.register_read_bytes("xmm0"), bytes(range(16)))
+        eng.close()
+
+
 @unittest.skipUnless(HAS_ICICLE and "gdb" in EXT_CAPS,
                      "extended Icicle binding (icicle_ext/) not installed")
 class TestIcicleGdb(unittest.TestCase):

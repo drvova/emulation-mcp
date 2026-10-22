@@ -183,6 +183,41 @@ class TestAngrEngine(unittest.TestCase):
         for arch in ARCH_MAP:
             self.assertIn(arch, COMMON_REGS, f"No COMMON_REGS for {arch}")
 
+    def test_call_function(self):
+        # int f(int a, int b){ return a + b; }  ->  lea eax,[rdi+rsi]; ret
+        eng = AngrEngine(arch="x86_64")
+        eng.memory_write(CODE_BASE, bytes.fromhex("8d0437" "c3"))
+        result = eng.call_function(CODE_BASE, [3, 4])
+        self.assertIsNotNone(result.get("return_value"), result)
+        self.assertEqual(result["return_value"]["int"], 7)
+        self.assertIn("function_call", eng.CAPABILITIES)
+        eng.close()
+
+    def test_cfg_and_functions(self):
+        eng = AngrEngine(arch="x86_64")
+        eng.memory_write(CODE_BASE, bytes.fromhex("8d0437" "c3" "9090" "b800000000" "c3"))
+        cfg = eng.recover_cfg(fast=True)
+        self.assertNotIn("error", cfg, cfg)
+        self.assertGreaterEqual(len(cfg["functions"]), 1)
+        self.assertGreaterEqual(len(eng.list_functions()), 1)
+        self.assertIn("cfg", eng.CAPABILITIES)
+        eng.close()
+
+    def test_explore_with_techniques(self):
+        # Same crackme as test_symbolic_explore, but drive it with DFS + a
+        # length limiter to prove techniques are accepted and still solve.
+        eng = AngrEngine(arch="x86_64")
+        code = ("4889f8" "483534120000" "483d55550000"
+                "7506" "b801000000" "c3" "31c0" "c3")
+        eng.memory_write(CODE_BASE, bytes.fromhex(code))
+        eng.state.regs.pc = CODE_BASE
+        var = eng.set_symbolic_register("rdi")
+        result = eng.explore(find=[CODE_BASE + 0x11], avoid=[CODE_BASE + 0x17],
+                             techniques=["dfs", "lengthlimiter:1000"])
+        self.assertEqual(result["status"], "found", result)
+        self.assertEqual(eng.solve(var, 1)[0], 0x1234 ^ 0x5555)
+        eng.close()
+
 
 if __name__ == "__main__":
     if not HAS_ANGR:

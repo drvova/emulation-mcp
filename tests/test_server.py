@@ -273,6 +273,41 @@ class TestExtendedIcicleTools(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
+    def test_wide_registers_via_server(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            caps = server.sessions.get(sid).CAPABILITIES
+            if "wide_registers" not in caps:
+                self.skipTest("binding lacks wide-register access")
+            w = _fn(server.emu_register_write_wide)(sid, "xmm0", "000102030405060708090a0b0c0d0e0f")
+            self.assertIn("Wrote", w)
+            r = _fn(server.emu_register_read_wide)(sid, "xmm0")
+            self.assertIn("000102030405060708090a0b0c0d0e0f", r)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_callback_hook_via_eval(self):
+        """Python-callback hooks are driveable through emu_eval."""
+        orig = server.ENABLE_EVAL
+        server.ENABLE_EVAL = True
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            caps = server.sessions.get(sid).CAPABILITIES
+            if "callback_hooks" not in caps:
+                self.skipTest("binding lacks callback hooks")
+            _fn(server.emu_memory_write)(sid, "0x1000000", "9090909090")
+            out = _fn(server.emu_eval)(sid,
+                "hits = []\n"
+                "engine.add_callback_hook(lambda a: hits.append(a))\n"
+                "engine.start(0x1000000, 0x1000005)\n"
+                "result = len(hits)")
+            self.assertIn("result:", out)
+            # at least one block entry recorded
+            self.assertNotIn("result: 0", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+            server.ENABLE_EVAL = orig
+
     def test_coverage_via_server(self):
         sid = _new_session(engine="icicle", arch="x86_64")
         try:
@@ -440,6 +475,27 @@ class TestAngrThroughServer(unittest.TestCase):
         try:
             out = _fn(server.emu_set_symbolic_register)(sid, "rax")
             self.assertIn("not supported", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_cfg_and_call_function_via_server(self):
+        sid = _new_session(engine="angr", arch="x86_64")
+        try:
+            # f(a,b)=a+b : lea eax,[rdi+rsi]; ret
+            _fn(server.emu_memory_write)(sid, "0x1000000", "8d0437c3")
+            call = _fn(server.emu_call_function)(sid, "0x1000000", ["3", "4"])
+            self.assertIn("(7)", call)
+            cfg = _fn(server.emu_cfg)(sid)
+            self.assertIn("functions", cfg)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_cfg_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_cfg)(sid))
+            self.assertIn("not supported",
+                          _fn(server.emu_call_function)(sid, "0x1000000"))
         finally:
             _fn(server.emu_close_session)(sid)
 

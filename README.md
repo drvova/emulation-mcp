@@ -55,6 +55,12 @@ much more of the framework, and the wrapper detects it automatically:
   snippet. Static binaries work directly; see `icicle_ext/README.md`.
 - **Block coverage** — `emu_coverage` (enable / get / clear) records the basic
   blocks executed, for triage and fuzzing-style analysis.
+- **Python-callback hooks** — `engine.add_callback_hook(fn, address=None)` (via
+  `emu_eval`) runs arbitrary Python on every basic block or at a specific
+  address *during* emulation — the bottom-level primitive for custom coverage,
+  tracing, taint, etc.
+- **Wide registers** — `emu_register_read_wide` / `emu_register_write_wide`
+  read/write registers wider than 64 bits (XMM/YMM/vector/flag aggregates).
 - **GDB remote stub** — `emu_gdb_serve` serves a GDB stub so you can attach a
   real `gdb` (`target remote host:port`). By default it runs the stub in a
   **detached subprocess** seeded from a full snapshot of the session (all mapped
@@ -70,8 +76,11 @@ show which are active).
 
 ### angr — symbolic execution *(new)*
 - Make a register or region of memory **symbolic**, then explore every path
-- `emu_explore` drives execution toward a target address (and away from others)
-  and `emu_solve` recovers the concrete inputs that get there
+- `emu_explore` drives execution toward a target address (and away from others),
+  optionally with exploration techniques (`dfs`, `loopseer`, `lengthlimiter`) or
+  Veritesting; `emu_solve` recovers the concrete inputs that get there
+- `emu_cfg` recovers a control-flow graph and lists functions; `emu_call_function`
+  runs a function with concrete args (calling-convention aware) and returns the result
 - Works on raw shellcode (shellcode mode) or whole binaries (binary mode)
 - Also supports the ordinary concrete workflow (run, step, read state, snapshots)
 
@@ -94,12 +103,16 @@ show which are active).
 | memory trace        |   ✓     |        |        |      |
 | snapshots           |   ✓     |   ✓    |   ✓    |  ✓   |
 | symbolic execution  |         |        |        |  ✓   |
+| CFG / functions     |         |        |        |  ✓   |
+| function calls      |         |        |        |  ✓   |
 | memory management   |         |        |   ✓    |      |
 | breakpoints         |         |        |   ✓    |      |
 | register introspection |      |        |   ✓    |      |
 | reverse execution   |         |        |  ✓ †   |      |
 | native disassembly  |         |        |  ✓ †   |      |
 | call stack          |         |        |  ✓ †   |      |
+| callback hooks      |         |        |  ✓ †   |      |
+| wide registers      |         |        |  ✓ †   |      |
 | Linux OS emulation  |         |   ✓    |  ✓ †   |      |
 | block coverage      |         |        |  ✓ †   |      |
 | GDB remote stub     |         |        |  ✓ †   |      |
@@ -155,6 +168,8 @@ Engine-specific tools:
 - `emu_list_engines` — discover installed engines and capabilities
 - `emu_hook_syscall`, `emu_hook_api` — Qiling only
 - `emu_set_symbolic_register`, `emu_set_symbolic_memory`, `emu_explore`, `emu_solve` — angr only
+- `emu_cfg`, `emu_call_function` — CFG/function listing and function execution (angr)
+- `emu_register_read_wide`, `emu_register_write_wide` — >64-bit registers (extended Icicle)
 - `emu_memory_unmap`, `emu_memory_protect` — runtime memory management (Icicle)
 - `emu_breakpoint_add`, `emu_breakpoint_remove` — execution breakpoints (Icicle)
 - `emu_list_registers` — full register-file introspection (Icicle)

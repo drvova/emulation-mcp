@@ -238,8 +238,14 @@ class IcicleEngine(BaseEngine):
         self._has_linux = hasattr(self.vm, "linux_load")
         self._has_coverage = hasattr(self.vm, "enable_coverage")
         self._has_gdb = hasattr(self.vm, "gdb_serve")
+        self._has_callback_hooks = hasattr(self.vm, "add_py_block_hook")
+        self._has_wide_regs = hasattr(self.vm, "reg_read_bytes")
 
         caps = set(type(self).CAPABILITIES)
+        if self._has_callback_hooks:
+            caps.add("callback_hooks")
+        if self._has_wide_regs:
+            caps.add("wide_registers")
         if self._has_reverse:
             caps.add("reverse_execution")
         if self._has_callstack:
@@ -754,6 +760,55 @@ class IcicleEngine(BaseEngine):
         self._touch()
         if self._has_coverage:
             self.vm.clear_coverage()
+
+    # -- Python-callback hooks (extended binding) --
+
+    def add_callback_hook(self, callback: Callable, address: int | None = None) -> str:
+        """Register a Python callback fired during emulation.
+
+        address=None fires on every basic-block entry (general instrumentation);
+        otherwise it fires when that address executes. Install before running.
+        The callback is observe-only (must not re-enter this engine).
+        """
+        self._touch()
+        if not self._has_callback_hooks:
+            raise NotImplementedError(
+                "Callback hooks require the extended Icicle binding (icicle_ext/)."
+            )
+        hook_id = self._gen_id("cb-")
+        if address is None:
+            self.vm.add_py_block_hook(callback)
+            info = HookInfo(hook_id, "callback_block", "all-blocks", "Python block callback")
+        else:
+            self.vm.add_py_hook(address, callback)
+            info = HookInfo(hook_id, "callback", f"0x{address:x}",
+                            f"Python callback at 0x{address:x}")
+        self.hooks[hook_id] = info
+        return hook_id
+
+    # -- Wide (>64-bit) register access (extended binding) --
+
+    def register_read_bytes(self, name: str) -> bytes:
+        self._touch()
+        if not self._has_wide_regs:
+            raise NotImplementedError(
+                "Wide-register access requires the extended Icicle binding (icicle_ext/)."
+            )
+        try:
+            return bytes(self.vm.reg_read_bytes(name.lower()))
+        except KeyError as e:
+            raise ValueError(f"Unknown register '{name}' for arch '{self.arch}'") from e
+
+    def register_write_bytes(self, name: str, data: bytes) -> None:
+        self._touch()
+        if not self._has_wide_regs:
+            raise NotImplementedError(
+                "Wide-register access requires the extended Icicle binding (icicle_ext/)."
+            )
+        try:
+            self.vm.reg_write_bytes(name.lower(), bytes(data))
+        except KeyError as e:
+            raise ValueError(f"Unknown register '{name}' for arch '{self.arch}'") from e
 
     # -- GDB stub (extended binding) --
 

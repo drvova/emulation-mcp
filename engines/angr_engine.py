@@ -77,6 +77,7 @@ class AngrEngine(BaseEngine):
     CAPABILITIES = frozenset({
         "shellcode", "binary_loading", "address_hooks",
         "instruction_trace", "snapshots", "symbolic",
+        "cfg", "function_call",
     })
     SUPPORTED_ARCHS = tuple(ARCH_MAP)
 
@@ -501,14 +502,40 @@ class AngrEngine(BaseEngine):
         self._symvars[var_name] = sym
         return var_name
 
+    def _apply_techniques(self, simgr, techniques: list[str] | None) -> None:
+        """Attach angr exploration techniques by name, e.g. 'dfs',
+        'loopseer:128', 'lengthlimiter:1000'."""
+        import angr as _angr
+        for spec in (techniques or []):
+            name, _, arg = spec.partition(":")
+            name = name.strip().lower()
+            try:
+                if name == "dfs":
+                    simgr.use_technique(_angr.exploration_techniques.DFS())
+                elif name == "loopseer":
+                    simgr.use_technique(_angr.exploration_techniques.LoopSeer(
+                        bound=int(arg) if arg else 128))
+                elif name == "lengthlimiter":
+                    simgr.use_technique(_angr.exploration_techniques.LengthLimiter(
+                        max_length=int(arg) if arg else 1000))
+                elif name == "oppologist":
+                    simgr.use_technique(_angr.exploration_techniques.Oppologist())
+            except Exception:
+                pass
+
     def explore(
         self,
         find: list[int],
         avoid: list[int] | None = None,
         timeout_ms: int = 30000,
         num_find: int = 1,
+        techniques: list[str] | None = None,
+        veritesting: bool = False,
     ) -> dict[str, Any]:
         """Explore paths from the current state to any `find` address.
+
+        techniques: optional exploration techniques ('dfs', 'loopseer[:bound]',
+          'lengthlimiter[:max]', 'oppologist'). veritesting enables Veritesting.
 
         Returns a summary including solved values for every symbolic variable,
         for each state that reached a target.
@@ -517,7 +544,8 @@ class AngrEngine(BaseEngine):
         avoid = avoid or []
         find_clean = [self._clean_addr(a) for a in find]
         avoid_clean = [self._clean_addr(a) for a in avoid]
-        simgr = self.proj.factory.simulation_manager(self.state)
+        simgr = self.proj.factory.simulation_manager(self.state, veritesting=veritesting)
+        self._apply_techniques(simgr, techniques)
 
         deadline = time.time() + max(timeout_ms, 1) / 1000.0
         aborted = ""
@@ -586,6 +614,78 @@ class AngrEngine(BaseEngine):
 
     def list_symbolic(self) -> list[dict[str, Any]]:
         return [{"name": n, "bits": s.size()} for n, s in self._symvars.items()]
+
+    # -- Static analysis (angr-specific) --
+
+    def recover_cfg(self, fast: bool = True) -> dict[str, Any]:
+        """Recover a control-flow graph and the functions in it."""
+        self._touch()
+        try:
+            if fast:
+                cfg = self.proj.analyses.CFGFast(normalize=True)
+            else:
+                cfg = self.proj.analyses.CFGEmulated(normalize=True)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        self._cfg = cfg
+        funcs = []
+        for fn in self.proj.kb.functions.values():
+            funcs.append({
+                "address": f"0x{fn.addr:x}",
+                "name": fn.name,
+                "size": getattr(fn, "size", 0),
+                "is_plt": bool(getattr(fn, "is_plt", False)),
+            })
+        funcs.sort(key=lambda f: int(f["address"], 16))
+        return {"nodes": cfg.graph.number_of_nodes(),
+                "edges": cfg.graph.number_of_edges(),
+                "functions": funcs}
+
+    def list_functions(self) -> list[dict[str, Any]]:
+        """List recovered functions (runs CFGFast first if needed)."""
+        if getattr(self, "_cfg", None) is None:
+            self.recover_cfg(fast=True)
+        out = []
+        for fn in self.proj.kb.functions.values():
+            out.append({"address": f"0x{fn.addr:x}", "name": fn.name,
+                        "size": getattr(fn, "size", 0)})
+        out.sort(key=lambda f: int(f["address"], 16))
+        return out
+
+    def call_function(self, address: int, args: list[int] | None = None) -> dict[str, Any]:
+        """Execute a function with concrete integer args and return its result,
+        using angr's calling-convention-aware `callable`."""
+        self._touch()
+        args = args or []
+        try:
+            caller = self.proj.factory.callable(
+                self._clean_addr(address), concrete_only=True,
+                add_options={angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
+                             angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS},
+            )
+            ret = caller(*args)
+        except Exception:
+            # Retry allowing path forks (symbolic / multi-path return).
+            try:
+                caller = self.proj.factory.callable(
+                    self._clean_addr(address), concrete_only=False,
+                    add_options={angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
+                                 angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS},
+                )
+                ret = caller(*args)
+            except Exception as e:
+                return {"error": f"{type(e).__name__}: {e}"}
+        if ret is None:
+            return {"address": f"0x{address:x}", "args": args, "return_value": None}
+        try:
+            val = caller.result_state.solver.eval(ret)
+        except Exception:
+            val = None
+        return {
+            "address": f"0x{address:x}",
+            "args": args,
+            "return_value": {"hex": f"0x{val:x}", "int": val} if val is not None else None,
+        }
 
     # -- Lifecycle --
 
