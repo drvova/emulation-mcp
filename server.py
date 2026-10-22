@@ -1895,6 +1895,48 @@ def emu_pcode(session_id: str, address: str) -> str:
 
 
 @mcp.tool()
+def emu_cmplog(session_id: str, action: str = "get", instrument_calls: bool = False) -> str:
+    """Record or read compare operands — RedQueen / input-to-state ('cmplog').
+
+    Instrument comparisons so that, during a run, the concrete operand pairs seen
+    at each compare are captured. This tells a fuzzer exactly which bytes a
+    magic-value or checksum check wants. Enable it, run, then read.
+
+    session_id: Active session ID.
+    action: "enable" to install instrumentation (before running), "get" to read
+      the observed compares (default), "clear" to reset the recorded operands.
+    instrument_calls: with action="enable", also log memcmp/strcmp-style calls.
+
+    Note: a compare whose operands are both statically constant in their block is
+    dropped as uninteresting — the useful case has a runtime/input-derived side.
+    """
+    try:
+        engine = sessions.get(session_id)
+        if action == "enable":
+            engine.enable_cmplog(instrument_calls)
+            return "Compare logging enabled. Run the program, then call with action='get'."
+        if action == "clear":
+            engine.clear_cmplog()
+            return "Compare log cleared."
+        if action == "get":
+            entries = engine.get_cmplog()
+            if not entries:
+                return "No compares recorded (enable before running; a runtime-derived operand is needed)."
+            lines = [f"Compares observed ({len(entries)} sites):"]
+            for e in entries[:200]:
+                ops = ", ".join(f"({a:#x} vs {b:#x})" for a, b in e["operands"][:8])
+                lines.append(f"  {e['address']} {e['kind']}: {ops}")
+            return "\n".join(lines)
+        return "Error: action must be 'enable', 'get', or 'clear'."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Cmplog error: {e}"
+
+
+@mcp.tool()
 def emu_memory_maps(session_id: str) -> str:
     """List the guest's mapped memory regions (Qiling).
 

@@ -551,6 +551,44 @@ class TestIcicleMmio(unittest.TestCase):
         eng.close()
 
 
+@unittest.skipUnless(HAS_ICICLE and "cmplog" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleCmplog(unittest.TestCase):
+    def test_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("cmplog", eng.CAPABILITIES)
+        eng.close()
+
+    def test_records_operands(self):
+        eng = IcicleEngine(arch="x86_64")
+        eng.enable_cmplog()
+        # cmp eax, 0x1337cafe ; jne +3 ; nop*3 ; nop ; hlt  (rax set at runtime
+        # so the compare is not statically constant and is therefore recorded)
+        eng.memory_write(CODE_BASE, bytes.fromhex("3dfeca3713" "7503" "909090" "90" "f4"))
+        eng.register_write("rax", 0x41414141)
+        eng.vm.icount_limit = 20
+        eng.register_write("rip", CODE_BASE)
+        eng.start(CODE_BASE)
+        log = eng.get_cmplog()
+        self.assertEqual(len(log), 1, log)
+        self.assertEqual(log[0]["address"], f"0x{CODE_BASE:x}")
+        self.assertIn([0x41414141, 0x1337cafe], log[0]["operands"])
+        eng.clear_cmplog()
+        self.assertEqual(eng.get_cmplog(), [])
+        eng.close()
+
+    def test_static_compare_dropped(self):
+        # Both operands statically constant in the block -> uninteresting -> dropped.
+        eng = IcicleEngine(arch="x86_64")
+        eng.enable_cmplog()
+        eng.memory_write(CODE_BASE, bytes.fromhex("b841414141" "3dfeca3713" "7503" "909090" "90" "f4"))
+        eng.vm.icount_limit = 20
+        eng.register_write("rip", CODE_BASE)
+        eng.start(CODE_BASE)
+        self.assertEqual(eng.get_cmplog(), [])
+        eng.close()
+
+
 @unittest.skipUnless(HAS_ICICLE and "wide_registers" in EXT_CAPS,
                      "extended Icicle binding (icicle_ext/) not installed")
 class TestIcicleWideRegisters(unittest.TestCase):

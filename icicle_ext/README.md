@@ -21,6 +21,7 @@ server can use it.
 | Memory-access hooks | `add_mem_write_hook`, `add_mem_read_hook` (+ `remove_*`) | `memory_hooks` — observe guest reads/writes in a range (data watchpoints, taint, memory tracing) |
 | P-code IL | `get_pcode` | `pcode_il` — lift a block to the SLEIGH intermediate language (the IR the VM executes) |
 | MMIO regions | `map_mmio` | `mmio` — memory-mapped I/O serviced by Python callbacks (device/peripheral registers, no RAM backing) |
+| Compare logging | `enable_cmplog`, `get_cmplog`, `clear_cmplog` | `cmplog` — record compare operands (RedQueen / input-to-state) for magic-value/checksum solving |
 | Wide registers | `reg_read_bytes`, `reg_write_bytes` | `wide_registers` — XMM/YMM/vector/flag aggregates |
 
 The stock wheel is still fully supported — the Python wrapper
@@ -68,11 +69,13 @@ for this server, not because they were missed:
 - **The JIT backend internals** (`icicle-jit`). The binding selects the JIT vs.
   interpreter via the `jit` constructor knob and otherwise treats compilation as
   an implementation detail; there is nothing to drive from Python.
-- **The native fuzzing/AFL trace format** (`afl-icicle-trace`,
-  `icicle-fuzzing`). The server ships its own coverage-guided loop (`emu_fuzz`,
-  `fuzzing.py`) built on the exposed block-coverage and snapshot primitives, so
-  the on-disk AFL trace format is not surfaced.
+- **The AFL++ forkserver harness** (`afl-icicle-trace`) and the AFL
+  shared-memory trace format. The server ships its own coverage-guided loop
+  (`emu_fuzz`, `fuzzing.py`) and a GDB stub, so the AFL frontend glue isn't
+  surfaced. (From `icicle-fuzzing` itself, the compare-logging / RedQueen
+  instrumentation *is* now exposed as `enable_cmplog`/`get_cmplog`.)
 
 Everything with a sensible Python surface — VM/CPU/MMU, snapshots, reverse
-execution, disassembly, call stack, coverage, GDB, Linux userspace, and the
-instruction/block/memory hooks — is reachable through the wrapper or `emu_eval`.
+execution, disassembly, p-code IL, call stack, coverage, compare logging, GDB,
+Linux userspace, MMIO, and the instruction/block/memory hooks — is reachable
+through the wrapper or `emu_eval`.

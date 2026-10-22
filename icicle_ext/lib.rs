@@ -316,6 +316,8 @@ pub struct Icicle {
     snapshots: Vec<icicle_vm::Snapshot>,
     // Set of basic-block addresses executed, when coverage is enabled.
     coverage: Option<Rc<RefCell<HashSet<u64>>>>,
+    // Compare-logging (RedQueen / input-to-state) instrumentation, when enabled.
+    cmplog: Option<icicle_fuzzing::cmplog2::CmpLog2Ref>,
 }
 
 /// Map a core VmExit to the Python-facing RunStatus enum.
@@ -530,6 +532,7 @@ impl Icicle {
             regs,
             snapshots: Vec::new(),
             coverage: None,
+            cmplog: None,
         })
     }
 
@@ -889,6 +892,73 @@ impl Icicle {
     pub fn clear_coverage(&mut self) {
         if let Some(set) = &self.coverage {
             set.borrow_mut().clear();
+        }
+    }
+
+    // ---- Compare logging (RedQueen / input-to-state) ----
+
+    /// Instrument comparisons so that, during execution, the concrete operand
+    /// pairs seen at each compare are recorded. This is the input-to-state /
+    /// RedQueen primitive: it tells a fuzzer exactly which bytes a magic-value
+    /// or checksum check wants. `instrument_calls=True` also logs memcmp/strcmp
+    /// style call-argument comparisons. Install before running.
+    #[pyo3(signature = (instrument_calls = false))]
+    pub fn enable_cmplog(&mut self, instrument_calls: bool) {
+        let cmplog = icicle_fuzzing::cmplog2::CmpLog2Builder::new()
+            .instrument_calls(instrument_calls)
+            .finish(&mut self.vm);
+        cmplog.set_enabled(&mut self.vm.cpu, true);
+        self.cmplog = Some(cmplog);
+    }
+
+    /// Whether compare logging is currently installed.
+    pub fn cmplog_enabled(&self) -> bool {
+        self.cmplog.is_some()
+    }
+
+    /// Recorded instruction-compare operands: one `(address, kind, pairs)` entry
+    /// per instrumented compare site, where `pairs` is the list of `(lhs, rhs)`
+    /// values observed there (sign-extended). Empty unless `enable_cmplog` ran.
+    pub fn get_cmplog(&mut self) -> Vec<(u64, String, Vec<(i64, i64)>)> {
+        let mut out = Vec::new();
+        if let Some(cmplog) = &self.cmplog {
+            for entry in cmplog.get_inst_log(&mut self.vm.cpu) {
+                if entry.values.is_empty() {
+                    continue;
+                }
+                out.push((entry.addr, format!("{:?}", entry.op.kind), entry.values.clone()));
+            }
+        }
+        out
+    }
+
+    /// Recorded call-compare operands (memcmp/strcmp style), one
+    /// `(address, is_indirect, pairs)` entry per site; each pair is the two
+    /// compared byte buffers as hex. Only populated when `enable_cmplog` was
+    /// called with `instrument_calls=True`.
+    pub fn get_cmplog_calls(&mut self) -> Vec<(u64, bool, Vec<(String, String)>)> {
+        let mut out = Vec::new();
+        if let Some(cmplog) = &self.cmplog {
+            for entry in cmplog.get_call_log(&mut self.vm.cpu) {
+                if entry.values.is_empty() {
+                    continue;
+                }
+                let hex_of = |bytes: &[u8]| -> String {
+                    bytes.iter().map(|b| format!("{b:02x}")).collect()
+                };
+                let pairs = entry.values.iter()
+                    .map(|(a, b)| (hex_of(a), hex_of(b)))
+                    .collect();
+                out.push((entry.addr, entry.is_indirect, pairs));
+            }
+        }
+        out
+    }
+
+    /// Clear the recorded compare operands (instrumentation stays installed).
+    pub fn clear_cmplog(&mut self) {
+        if let Some(cmplog) = &self.cmplog {
+            cmplog.clear_data(&mut self.vm.cpu);
         }
     }
 

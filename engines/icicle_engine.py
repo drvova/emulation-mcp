@@ -243,6 +243,7 @@ class IcicleEngine(BaseEngine):
         self._has_mem_hooks = hasattr(self.vm, "add_mem_write_hook")
         self._has_pcode = hasattr(self.vm, "get_pcode")
         self._has_mmio = hasattr(self.vm, "map_mmio")
+        self._has_cmplog = hasattr(self.vm, "enable_cmplog")
 
         caps = set(type(self).CAPABILITIES)
         if self._has_callback_hooks:
@@ -253,6 +254,8 @@ class IcicleEngine(BaseEngine):
             caps.add("pcode_il")
         if self._has_mmio:
             caps.add("mmio")
+        if self._has_cmplog:
+            caps.add("cmplog")
         if self._has_wide_regs:
             caps.add("wide_registers")
         if self._has_reverse:
@@ -768,6 +771,42 @@ class IcicleEngine(BaseEngine):
             )
         if not self.vm.map_mmio(start, size, read_cb, write_cb):
             raise RuntimeError(f"Failed to map MMIO region at 0x{start:x} (size=0x{size:x}).")
+
+    # -- Compare logging / RedQueen (extended binding) --
+
+    def enable_cmplog(self, instrument_calls: bool = False) -> None:
+        """Instrument comparisons to record the concrete operand pairs seen at
+        each one — the input-to-state (RedQueen) signal a fuzzer uses to solve
+        magic-value and checksum checks. Install before running. Note a compare
+        whose operands are both statically constant in its block is dropped as
+        uninteresting; the interesting case is a runtime/input-derived operand.
+        """
+        self._touch()
+        if not self._has_cmplog:
+            raise NotImplementedError(
+                "Compare logging requires the extended Icicle binding (icicle_ext/)."
+            )
+        self.vm.enable_cmplog(instrument_calls)
+
+    def get_cmplog(self) -> list[dict[str, Any]]:
+        """Return observed compares: a list of {address, kind, operands:[[a,b]...]}
+        for each instrumented compare site that executed."""
+        self._touch()
+        if not self._has_cmplog:
+            raise NotImplementedError(
+                "Compare logging requires the extended Icicle binding (icicle_ext/)."
+            )
+        out: list[dict[str, Any]] = []
+        for addr, kind, pairs in self.vm.get_cmplog():
+            out.append({"address": f"0x{addr:x}", "kind": kind,
+                        "operands": [[a, b] for a, b in pairs]})
+        return out
+
+    def clear_cmplog(self) -> None:
+        """Clear recorded compare operands (instrumentation stays installed)."""
+        self._touch()
+        if self._has_cmplog:
+            self.vm.clear_cmplog()
 
     # -- Linux userspace (extended binding) --
 

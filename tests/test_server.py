@@ -384,6 +384,29 @@ class TestExtendedIcicleTools(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
+    def test_cmplog_via_server(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            if "cmplog" not in server.sessions.get(sid).CAPABILITIES:
+                self.skipTest("binding lacks compare logging")
+            self.assertIn("enabled", _fn(server.emu_cmplog)(sid, "enable").lower())
+            # cmp eax,0x1337cafe ; jne +3 ; nop*3 ; nop ; hlt  (rax set at runtime)
+            _fn(server.emu_memory_write)(sid, "0x1000000", "3dfeca371375039090909090f4")
+            _fn(server.emu_register_write)(sid, "rax", "0x41414141")
+            _fn(server.emu_run)(sid, "0x1000000", "")
+            out = _fn(server.emu_cmplog)(sid, "get")
+            self.assertIn("0x41414141", out)
+            self.assertIn("0x1337cafe", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_cmplog_rejected_on_unicorn(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            self.assertIn("not supported", _fn(server.emu_cmplog)(sid, "get"))
+        finally:
+            _fn(server.emu_close_session)(sid)
+
     def test_coverage_via_server(self):
         sid = _new_session(engine="icicle", arch="x86_64")
         try:

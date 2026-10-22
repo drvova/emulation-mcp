@@ -92,6 +92,7 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "memory_hooks": "Register Python callbacks on guest memory reads/writes (watchpoints)",
     "pcode_il": "Lift code to the engine's p-code intermediate language",
     "mmio": "Map memory-mapped I/O regions serviced by Python callbacks",
+    "cmplog": "Compare logging (RedQueen / input-to-state): record compare operands",
     "filesystem": "Map host files/directories into the emulated filesystem",
     "io": "Feed the guest's stdin and capture its stdout/stderr",
     "wide_registers": "Read/write registers wider than 64 bits (vector/flag aggregates)",
@@ -240,6 +241,18 @@ class BaseEngine(ABC):
                  write_cb: Callable | None = None) -> None:
         """Map an MMIO region serviced by Python callbacks. 'mmio' capability."""
         raise NotImplementedError(f"MMIO mapping is not supported by the '{self.engine_type}' engine")
+
+    def enable_cmplog(self, instrument_calls: bool = False) -> None:
+        """Instrument comparisons to record operand pairs (RedQueen). 'cmplog'."""
+        raise NotImplementedError(f"Compare logging is not supported by the '{self.engine_type}' engine")
+
+    def get_cmplog(self) -> list[dict[str, Any]]:
+        """Return the recorded compare operands. 'cmplog' capability."""
+        raise NotImplementedError(f"Compare logging is not supported by the '{self.engine_type}' engine")
+
+    def clear_cmplog(self) -> None:
+        """Clear recorded compare operands (instrumentation stays). 'cmplog'."""
+        raise NotImplementedError(f"Compare logging is not supported by the '{self.engine_type}' engine")
 
     def enable_coverage(self) -> None:
         """Start recording executed basic blocks. 'coverage' capability."""
