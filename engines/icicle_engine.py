@@ -240,10 +240,13 @@ class IcicleEngine(BaseEngine):
         self._has_gdb = hasattr(self.vm, "gdb_serve")
         self._has_callback_hooks = hasattr(self.vm, "add_py_block_hook")
         self._has_wide_regs = hasattr(self.vm, "reg_read_bytes")
+        self._has_mem_hooks = hasattr(self.vm, "add_mem_write_hook")
 
         caps = set(type(self).CAPABILITIES)
         if self._has_callback_hooks:
             caps.add("callback_hooks")
+        if self._has_mem_hooks:
+            caps.add("memory_hooks")
         if self._has_wide_regs:
             caps.add("wide_registers")
         if self._has_reverse:
@@ -600,6 +603,13 @@ class IcicleEngine(BaseEngine):
         if info.hook_type == "address":
             addr = int(info.target, 16)
             self._addr_hooks.pop(addr, None)
+        elif info.hook_type in ("memory_read", "memory_write") and info._handle:
+            kind, native_id = info._handle
+            if native_id is not None:
+                if kind == "write":
+                    self.vm.remove_mem_write_hook(native_id)
+                else:
+                    self.vm.remove_mem_read_hook(native_id)
         del self.hooks[hook_id]
         return True
 
@@ -783,6 +793,52 @@ class IcicleEngine(BaseEngine):
             self.vm.add_py_hook(address, callback)
             info = HookInfo(hook_id, "callback", f"0x{address:x}",
                             f"Python callback at 0x{address:x}")
+        self.hooks[hook_id] = info
+        return hook_id
+
+    # -- Guest memory-access hooks / data watchpoints (extended binding) --
+
+    def add_mem_hook(
+        self,
+        callback: Callable,
+        kind: str = "write",
+        start: int | None = None,
+        end: int | None = None,
+    ) -> str:
+        """Register a Python callback fired on guest memory access.
+
+        kind="write" fires callback(addr, data: bytes) on each write whose
+        starting address falls in [start, end); kind="read" fires
+        callback(addr, size: int) on each such read. The range is end-exclusive
+        and matched on the access's starting address; None widens to (nearly)
+        the whole 64-bit space. The callback is observe-only (must not re-enter
+        this engine) and, like the block hooks, needs the interpreter
+        (jit=False, the default) to fire on every access. Install before
+        running. Remove with hook_remove().
+        """
+        self._touch()
+        if not self._has_mem_hooks:
+            raise NotImplementedError(
+                "Memory-access hooks require the extended Icicle binding (icicle_ext/)."
+            )
+        if kind not in ("read", "write"):
+            raise ValueError(f"kind must be 'read' or 'write', got {kind!r}")
+        lo = 0 if start is None else start
+        # Leave a page of headroom below u64::MAX: the MMU's page-aligned
+        # fast-path range adds a page to `end`, which would overflow at u64::MAX.
+        hi = 0xFFFFFFFFFFFF0000 if end is None else end
+        if kind == "write":
+            native_id = self.vm.add_mem_write_hook(lo, hi, callback)
+        else:
+            native_id = self.vm.add_mem_read_hook(lo, hi, callback)
+        hook_id = self._gen_id("mem-")
+        info = HookInfo(
+            hook_id,
+            f"memory_{kind}",
+            f"0x{lo:x}-0x{hi:x}",
+            f"Python {kind} hook on 0x{lo:x}-0x{hi:x}",
+            _handle=(kind, native_id),
+        )
         self.hooks[hook_id] = info
         return hook_id
 

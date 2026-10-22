@@ -235,6 +235,35 @@ fn convert_protection(protection: MemoryProtection) -> u8 {
     }
 }
 
+/// Observe-only guest memory hooks that forward each access to a Python
+/// callback. The callback must not re-enter the engine (the VM is borrowed
+/// for the duration of the run).
+struct PyWriteHook {
+    cb: PyObject,
+}
+
+impl icicle_cpu::mem::WriteHook for PyWriteHook {
+    fn write(&mut self, _mem: &mut icicle_cpu::Mmu, addr: u64, value: &[u8]) {
+        Python::attach(|py| {
+            let data = pyo3::types::PyBytes::new(py, value);
+            let _ = self.cb.bind(py).call1((addr, data));
+        });
+    }
+}
+
+struct PyReadHook {
+    cb: PyObject,
+}
+
+impl icicle_cpu::mem::ReadHook for PyReadHook {
+    fn read(&mut self, _mem: &mut icicle_cpu::Mmu, addr: u64, size: u8) -> Option<u64> {
+        Python::attach(|py| {
+            let _ = self.cb.bind(py).call1((addr, size));
+        });
+        None // observe only; do not override the value read
+    }
+}
+
 #[pyclass(unsendable, module = "icicle")]
 pub struct Icicle {
     architecture: String,
@@ -829,6 +858,35 @@ impl Icicle {
             });
         }));
         icicle_vm::injector::register_block_hook_injector(&mut self.vm, 0, u64::MAX, hook);
+    }
+
+    // ---- Guest memory-access hooks (data watchpoints / taint / tracing) ----
+
+    /// Call `callback(addr, data: bytes)` from Python on every guest *write*
+    /// whose starting address falls in `[start, end)` (end-exclusive). Returns
+    /// a hook id usable with `remove_mem_write_hook`. Observe-only: the callback
+    /// must not call back into this engine. Requires the interpreter
+    /// (jit=False) to fire on every access. Install before running.
+    pub fn add_mem_write_hook(&mut self, start: u64, end: u64, callback: PyObject) -> Option<u32> {
+        self.vm.cpu.mem.add_write_hook(start, end, Box::new(PyWriteHook { cb: callback }))
+    }
+
+    /// Remove a write hook by the id returned from `add_mem_write_hook`.
+    pub fn remove_mem_write_hook(&mut self, id: u32) -> bool {
+        self.vm.cpu.mem.remove_write_hook(id)
+    }
+
+    /// Call `callback(addr, size)` from Python on every guest *read* whose
+    /// starting address falls in `[start, end)` (end-exclusive). Returns a hook
+    /// id usable with `remove_mem_read_hook`. Observe-only (the value read is
+    /// never overridden). Same jit=False / install-before-running rules.
+    pub fn add_mem_read_hook(&mut self, start: u64, end: u64, callback: PyObject) -> Option<u32> {
+        self.vm.cpu.mem.add_read_hook(start, end, Box::new(PyReadHook { cb: callback }))
+    }
+
+    /// Remove a read hook by the id returned from `add_mem_read_hook`.
+    pub fn remove_mem_read_hook(&mut self, id: u32) -> bool {
+        self.vm.cpu.mem.remove_read_hook(id)
     }
 
     // ---- GDB remote stub ----

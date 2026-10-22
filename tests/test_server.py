@@ -308,6 +308,32 @@ class TestExtendedIcicleTools(unittest.TestCase):
             _fn(server.emu_close_session)(sid)
             server.ENABLE_EVAL = orig
 
+    def test_memory_hook_via_eval(self):
+        """Guest memory-access hooks are driveable through emu_eval."""
+        orig = server.ENABLE_EVAL
+        server.ENABLE_EVAL = True
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            caps = server.sessions.get(sid).CAPABILITIES
+            if "memory_hooks" not in caps:
+                self.skipTest("binding lacks memory hooks")
+            # mov [0x8000000], eax ; mov ebx, [0x8000000]
+            _fn(server.emu_memory_write)(sid, "0x1000000",
+                                         "89042500000008" "8b1c2500000008")
+            out = _fn(server.emu_eval)(sid,
+                "writes = []\n"
+                "engine.add_mem_hook(lambda a, d: writes.append((a, bytes(d))),\n"
+                "                    kind='write', start=0x8000000, end=0x8001000)\n"
+                "engine.register_write('rip', 0x1000000)\n"
+                "engine.register_write('rax', 0xdeadbeef)\n"
+                "engine.step(1); engine.step(1)\n"
+                "result = '%#x:%s' % (writes[0][0], writes[0][1].hex())")
+            self.assertIn("result:", out)
+            self.assertIn("0x8000000:efbeadde", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+            server.ENABLE_EVAL = orig
+
     def test_coverage_via_server(self):
         sid = _new_session(engine="icicle", arch="x86_64")
         try:

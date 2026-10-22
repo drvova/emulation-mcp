@@ -84,6 +84,7 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "cfg": "Recover a control-flow graph and list functions",
     "function_call": "Execute a function with concrete args (calling-convention aware)",
     "callback_hooks": "Register Python callbacks that fire during emulation",
+    "memory_hooks": "Register Python callbacks on guest memory reads/writes (watchpoints)",
     "wide_registers": "Read/write registers wider than 64 bits (vector/flag aggregates)",
 }
 
@@ -253,6 +254,22 @@ class BaseEngine(ABC):
     def add_callback_hook(self, callback: Callable, address: int | None = None) -> str:
         """Register a Python callback fired during emulation. 'callback_hooks'."""
         raise NotImplementedError(f"Callback hooks are not supported by the '{self.engine_type}' engine")
+
+    def add_mem_hook(
+        self,
+        callback: Callable,
+        kind: str = "write",
+        start: int | None = None,
+        end: int | None = None,
+    ) -> str:
+        """Register a Python callback fired on guest memory access. 'memory_hooks'.
+
+        kind="write" fires callback(addr, data: bytes) on each write in the
+        watched range; kind="read" fires callback(addr, size: int) on each read.
+        start/end bound the range, end-exclusive and matched on the access's
+        starting address; None widens to (nearly) the whole space.
+        """
+        raise NotImplementedError(f"Memory-access hooks are not supported by the '{self.engine_type}' engine")
 
     def register_read_bytes(self, name: str) -> bytes:
         """Read a register's full backing bytes (wide registers). 'wide_registers'."""

@@ -18,7 +18,7 @@ except ImportError:
 
 if HAS_ICICLE:
     from engines.icicle_engine import IcicleEngine, ARCH_MAP, COMMON_REGS
-    from engines.base import CODE_BASE
+    from engines.base import CODE_BASE, HEAP_BASE
 
     def _detect_caps():
         eng = IcicleEngine(arch="x86_64")
@@ -426,6 +426,70 @@ class TestIcicleCallbackHooks(unittest.TestCase):
         eng.memory_write(CODE_BASE, bytes.fromhex("90" * 10))
         eng.start(CODE_BASE, CODE_BASE + 10)
         self.assertEqual(hits, [CODE_BASE + 5])
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "memory_hooks" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleMemoryHooks(unittest.TestCase):
+    # mov [HEAP_BASE], eax ; mov ebx, [HEAP_BASE]  (disp32 = 0x08000000)
+    _CODE = bytes.fromhex("89042500000008" "8b1c2500000008")
+
+    def test_write_and_read_hooks_fire(self):
+        eng = IcicleEngine(arch="x86_64")
+        writes, reads = [], []
+        wid = eng.add_mem_hook(lambda a, d: writes.append((a, bytes(d))),
+                               kind="write", start=HEAP_BASE, end=HEAP_BASE + 0xfff)
+        rid = eng.add_mem_hook(lambda a, s: reads.append((a, s)),
+                               kind="read", start=HEAP_BASE, end=HEAP_BASE + 0xfff)
+        self.assertNotEqual(wid, rid)
+        eng.memory_write(CODE_BASE, self._CODE)
+        eng.register_write("rip", CODE_BASE)
+        eng.register_write("rax", 0xdeadbeef)
+        for _ in range(2):
+            eng.step(1)
+        self.assertEqual(writes, [(HEAP_BASE, b"\xef\xbe\xad\xde")])
+        self.assertEqual(reads, [(HEAP_BASE, 4)])
+        self.assertEqual(eng.register_read("rbx"), 0xdeadbeef)
+        eng.close()
+
+    def test_hook_remove_stops_callbacks(self):
+        eng = IcicleEngine(arch="x86_64")
+        writes = []
+        wid = eng.add_mem_hook(lambda a, d: writes.append(a),
+                               kind="write", start=HEAP_BASE, end=HEAP_BASE + 0xfff)
+        self.assertEqual(len(eng.list_hooks()), 1)
+        self.assertTrue(eng.hook_remove(wid))
+        self.assertEqual(eng.list_hooks(), [])
+        eng.memory_write(CODE_BASE, self._CODE)
+        eng.register_write("rip", CODE_BASE)
+        eng.register_write("rax", 1)
+        eng.step(1)
+        self.assertEqual(writes, [])  # hook removed before the write executed
+        eng.close()
+
+    def test_out_of_range_write_not_hooked(self):
+        eng = IcicleEngine(arch="x86_64")
+        writes = []
+        # Watch a window that the store (to HEAP_BASE) falls outside of.
+        eng.add_mem_hook(lambda a, d: writes.append(a),
+                         kind="write", start=HEAP_BASE + 0x800, end=HEAP_BASE + 0xfff)
+        eng.memory_write(CODE_BASE, self._CODE)
+        eng.register_write("rip", CODE_BASE)
+        eng.register_write("rax", 1)
+        eng.step(1)
+        self.assertEqual(writes, [])
+        eng.close()
+
+    def test_bad_kind_rejected(self):
+        eng = IcicleEngine(arch="x86_64")
+        with self.assertRaises(ValueError):
+            eng.add_mem_hook(lambda a, d: None, kind="exec")
+        eng.close()
+
+    def test_memory_hooks_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("memory_hooks", eng.CAPABILITIES)
         eng.close()
 
 

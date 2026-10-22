@@ -18,6 +18,7 @@ server can use it.
 | GDB remote stub | `gdb_serve` | `gdb` (attach a real debugger; server runs it non-blocking via a detached subprocess, see `gdb_server_runner.py`) |
 | Memory-map enumeration | `mem_map_ranges` | lets the server snapshot any session's real mappings (incl. Linux) for background GDB |
 | Python-callback hooks | `add_py_hook`, `add_py_block_hook` | `callback_hooks` — run arbitrary Python during emulation (observe-only) |
+| Memory-access hooks | `add_mem_write_hook`, `add_mem_read_hook` (+ `remove_*`) | `memory_hooks` — observe guest reads/writes in a range (data watchpoints, taint, memory tracing) |
 | Wide registers | `reg_read_bytes`, `reg_write_bytes` | `wide_registers` — XMM/YMM/vector/flag aggregates |
 
 The stock wheel is still fully supported — the Python wrapper

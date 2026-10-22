@@ -59,6 +59,11 @@ much more of the framework, and the wrapper detects it automatically:
   `emu_eval`) runs arbitrary Python on every basic block or at a specific
   address *during* emulation — the bottom-level primitive for custom coverage,
   tracing, taint, etc.
+- **Memory-access hooks / data watchpoints** — `engine.add_mem_hook(fn,
+  kind="write"|"read", start, end)` (via `emu_eval`) fires a Python callback on
+  every guest read or write in an address range (`write` → `fn(addr, data)`,
+  `read` → `fn(addr, size)`) — the primitive for data watchpoints, taint, and
+  memory tracing. Remove with `engine.hook_remove(id)`.
 - **Wide registers** — `emu_register_read_wide` / `emu_register_write_wide`
   read/write registers wider than 64 bits (XMM/YMM/vector/flag aggregates).
 - **GDB remote stub** — `emu_gdb_serve` serves a GDB stub so you can attach a
@@ -112,6 +117,7 @@ show which are active).
 | native disassembly  |         |        |  ✓ †   |      |
 | call stack          |         |        |  ✓ †   |      |
 | callback hooks      |         |        |  ✓ †   |      |
+| memory hooks        |         |        |  ✓ †   |      |
 | wide registers      |         |        |  ✓ †   |      |
 | Linux OS emulation  |         |   ✓    |  ✓ †   |      |
 | block coverage      |         |        |  ✓ †   |      |
