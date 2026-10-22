@@ -14,6 +14,8 @@ server can use it.
 | Call stack | `get_callstack` | `callstack` |
 | SLEIGH-native disassembly | `get_disasm`, `get_block_info` | `disassembly` (no capstone needed) |
 | Linux userspace emulation | `os="linux"`, `linux_load` | `os_emulation` (load an ELF, emulate syscalls) |
+| Block coverage | `enable_coverage`, `get_coverage`, `clear_coverage` | `coverage` |
+| GDB remote stub | `gdb_serve` | `gdb` (attach a real debugger) |
 
 The stock wheel is still fully supported — the Python wrapper
 (`engines/icicle_engine.py`) feature-detects these methods and only advertises
@@ -35,11 +37,12 @@ interpreter. Install it into the environment that runs the MCP server.
 
 ## How it's maintained
 
-`lib.rs` is a complete replacement for `icicle-python`'s `src/lib.rs` at the
-pinned commit (`ICICLE_PYTHON_COMMIT` in `build.sh`). The additions are grouped
-under an "Extended surface" comment block and a Linux section in the
-constructor. To track a newer upstream, bump the pinned commit and re-apply the
-same additions.
+`lib.rs` and `Cargo.toml` are complete replacements for `icicle-python`'s at the
+pinned commit (`ICICLE_PYTHON_COMMIT` in `build.sh`); `build.sh` overlays both
+onto a fresh checkout. `Cargo.toml` adds the `icicle-gdb` path dependency for
+the GDB stub. The additions in `lib.rs` are grouped under an "Extended surface"
+comment block plus Linux/coverage/GDB sections. To track a newer upstream, bump
+the pinned commit and re-apply the same additions.
 
 ## Linux mode notes
 

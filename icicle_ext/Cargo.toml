@@ -1,0 +1,27 @@
+[package]
+name = "icicle-python"
+edition = "2021"
+rust-version = "1.90.0"
+
+[lib]
+name = "icicle"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "tests"
+path = "tests.rs"
+
+[dependencies]
+pyo3 = { version = "0.27.1", features = ["indexmap", "abi3-py38"] }
+icicle-cpu = { path = "icicle-emu/icicle-cpu" }
+icicle-vm = { path = "icicle-emu/icicle-vm" }
+icicle-gdb = { path = "icicle-emu/icicle-gdb" }
+pcode = { path = "icicle-emu/sleigh/pcode" }
+sleigh-runtime = { path = "icicle-emu/sleigh/sleigh-runtime" }
+indexmap = "*"
+target-lexicon = "*"
+tracing = "*"
+tracing-subscriber = "*"
+
+[build-dependencies]
+pyo3-build-config = "0.27.1"

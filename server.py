@@ -1727,6 +1727,70 @@ def emu_disassemble(session_id: str, address: str, count: int = 10) -> str:
         return f"Disassemble error: {e}"
 
 
+@mcp.tool()
+def emu_coverage(session_id: str, action: str = "get") -> str:
+    """Record or read basic-block coverage ('coverage' capability).
+
+    Coverage instruments blocks as they are lifted, so enable it before running.
+
+    session_id: Active session ID.
+    action: "enable" to start recording, "get" to read the hit blocks (default),
+      "clear" to reset the set.
+    """
+    try:
+        engine = sessions.get(session_id)
+        if action == "enable":
+            engine.enable_coverage()
+            return "Coverage recording enabled (run the code now)."
+        if action == "clear":
+            engine.clear_coverage()
+            return "Coverage cleared."
+        if action == "get":
+            blocks = engine.get_coverage()
+            if not blocks:
+                return "No blocks covered yet (enable coverage before running)."
+            lines = [f"Covered basic blocks ({len(blocks)}):"]
+            for a in blocks[:200]:
+                lines.append(f"  0x{a:x}")
+            if len(blocks) > 200:
+                lines.append(f"  ... and {len(blocks) - 200} more")
+            return "\n".join(lines)
+        return f"Error: unknown action '{action}'. Use 'enable', 'get', or 'clear'."
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Coverage error: {e}"
+
+
+@mcp.tool()
+def emu_gdb_serve(session_id: str, address: str = "127.0.0.1:1234", timeout_secs: int = 30) -> str:
+    """Serve a GDB remote stub so a real debugger can attach ('gdb' capability).
+
+    Waits up to `timeout_secs` for one GDB client to connect to `address`, then
+    serves that debug session until the client detaches. Attach from another
+    terminal with:  gdb -ex "target remote <address>".
+
+    NOTE: this blocks the session for the duration of the debug session (the
+    emulated VM is single-threaded), so invoke it deliberately for interactive
+    debugging. It returns when the client detaches or the wait times out.
+
+    session_id: Active session ID.
+    address: host:port to listen on (default 127.0.0.1:1234).
+    timeout_secs: How long to wait for a client to connect (default 30).
+    """
+    try:
+        engine = sessions.get(session_id)
+        return engine.gdb_serve(address, timeout_secs)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"GDB serve error: {e}"
+
+
 # ===========================================================================
 # Snapshot Tools
 # ===========================================================================

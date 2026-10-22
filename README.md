@@ -53,6 +53,12 @@ much more of the framework, and the wrapper detects it automatically:
   "linux"}` and a `binary_path`; the emulated kernel loads the ELF (argv/env)
   and services syscalls, so you can run a whole Linux program, not just a
   snippet. Static binaries work directly; see `icicle_ext/README.md`.
+- **Block coverage** — `emu_coverage` (enable / get / clear) records the basic
+  blocks executed, for triage and fuzzing-style analysis.
+- **GDB remote stub** — `emu_gdb_serve` serves a GDB stub so you can attach a
+  real `gdb` (`target remote host:port`) to the emulated target. It blocks the
+  session for the debug session (the VM is single-threaded), so it's for
+  deliberate interactive debugging.
 
 The stock wheel remains fully supported — these features simply light up when
 the extended binding is present (`emu_list_engines` / a session's capabilities
@@ -91,6 +97,8 @@ show which are active).
 | native disassembly  |         |        |  ✓ †   |      |
 | call stack          |         |        |  ✓ †   |      |
 | Linux OS emulation  |         |   ✓    |  ✓ †   |      |
+| block coverage      |         |        |  ✓ †   |      |
+| GDB remote stub     |         |        |  ✓ †   |      |
 
 † Icicle feature available with the extended binding (`icicle_ext/`); see below.
 
@@ -148,6 +156,8 @@ Engine-specific tools:
 - `emu_list_registers` — full register-file introspection (Icicle)
 - `emu_step_back`, `emu_goto_icount` — reverse execution / time-travel (extended Icicle)
 - `emu_disassemble`, `emu_callstack` — native disassembly and call stack (extended Icicle)
+- `emu_coverage` — basic-block coverage enable/get/clear (extended Icicle)
+- `emu_gdb_serve` — serve a GDB remote stub to attach a real debugger (extended Icicle)
 - `emu_compare_engines` — Unicorn vs. Icicle differential check
 
 ### Reaching the whole engine surface

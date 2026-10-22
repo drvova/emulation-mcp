@@ -52,8 +52,9 @@ git clone --recurse-submodules https://github.com/icicle-emu/icicle-python "$WOR
 git -C "$WORK/icicle-python" checkout --quiet "$ICICLE_PYTHON_COMMIT"
 git -C "$WORK/icicle-python" submodule update --init --recursive --quiet
 
-echo ">> Overlaying extended src/lib.rs"
+echo ">> Overlaying extended src/lib.rs and Cargo.toml"
 cp "$HERE/lib.rs" "$WORK/icicle-python/src/lib.rs"
+cp "$HERE/Cargo.toml" "$WORK/icicle-python/Cargo.toml"
 
 echo ">> Building wheel"
 ( cd "$WORK/icicle-python" && "${MATURIN[@]}" build --release --interpreter "$PYTHON" --out dist )

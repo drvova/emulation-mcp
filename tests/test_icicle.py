@@ -384,6 +384,39 @@ class TestIcicleDisassembly(unittest.TestCase):
         eng.close()
 
 
+@unittest.skipUnless(HAS_ICICLE and "coverage" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleCoverage(unittest.TestCase):
+    def test_block_coverage(self):
+        eng = IcicleEngine(arch="x86_64")
+        # mov eax,1 ; test eax,eax ; jz +1 ; nop ; nop  -> two basic blocks
+        eng.memory_write(CODE_BASE, bytes.fromhex("b801000000" "85c0" "7401" "90" "90"))
+        eng.enable_coverage()
+        eng.start(CODE_BASE, CODE_BASE + 11)
+        blocks = eng.get_coverage()
+        self.assertGreaterEqual(len(blocks), 2, blocks)
+        self.assertIn(CODE_BASE, blocks)
+        eng.clear_coverage()
+        self.assertEqual(eng.get_coverage(), [])
+        eng.close()
+
+    def test_coverage_capability(self):
+        eng = IcicleEngine(arch="x86_64")
+        self.assertIn("coverage", eng.CAPABILITIES)
+        eng.close()
+
+
+@unittest.skipUnless(HAS_ICICLE and "gdb" in EXT_CAPS,
+                     "extended Icicle binding (icicle_ext/) not installed")
+class TestIcicleGdb(unittest.TestCase):
+    def test_gdb_serve_times_out_without_client(self):
+        eng = IcicleEngine(arch="x86_64")
+        with self.assertRaises(Exception):
+            # No client connects -> bounded wait then raises.
+            eng.gdb_serve("127.0.0.1:54399", timeout_secs=1)
+        eng.close()
+
+
 @unittest.skipUnless(HAS_ICICLE and HAS_LINUX_BINDING,
                      "extended Icicle binding with Linux support not installed")
 class TestIcicleLinux(unittest.TestCase):

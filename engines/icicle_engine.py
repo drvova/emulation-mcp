@@ -236,6 +236,8 @@ class IcicleEngine(BaseEngine):
         self._has_callstack = hasattr(self.vm, "get_callstack")
         self._has_native_disasm = hasattr(self.vm, "get_disasm")
         self._has_linux = hasattr(self.vm, "linux_load")
+        self._has_coverage = hasattr(self.vm, "enable_coverage")
+        self._has_gdb = hasattr(self.vm, "gdb_serve")
 
         caps = set(type(self).CAPABILITIES)
         if self._has_reverse:
@@ -244,6 +246,10 @@ class IcicleEngine(BaseEngine):
             caps.add("callstack")
         if self._has_native_disasm:
             caps.add("disassembly")
+        if self._has_coverage:
+            caps.add("coverage")
+        if self._has_gdb:
+            caps.add("gdb")
         if self._linux:
             caps.add("os_emulation")
             caps.add("binary_loading")
@@ -725,6 +731,39 @@ class IcicleEngine(BaseEngine):
         env_pairs = list((env or {}).items())
         self.vm.linux_load(binary_path, argv or [], env_pairs)
         self.binary_path = binary_path
+
+    # -- Coverage (extended binding) --
+
+    def enable_coverage(self) -> None:
+        self._touch()
+        if not self._has_coverage:
+            raise NotImplementedError(
+                "Coverage requires the extended Icicle binding (icicle_ext/)."
+            )
+        self.vm.enable_coverage()
+
+    def get_coverage(self) -> list[int]:
+        self._touch()
+        if not self._has_coverage:
+            raise NotImplementedError(
+                "Coverage requires the extended Icicle binding (icicle_ext/)."
+            )
+        return list(self.vm.get_coverage())
+
+    def clear_coverage(self) -> None:
+        self._touch()
+        if self._has_coverage:
+            self.vm.clear_coverage()
+
+    # -- GDB stub (extended binding) --
+
+    def gdb_serve(self, address: str = "127.0.0.1:1234", timeout_secs: int = 30) -> str:
+        self._touch()
+        if not self._has_gdb:
+            raise NotImplementedError(
+                "A GDB stub requires the extended Icicle binding (icicle_ext/)."
+            )
+        return self.vm.gdb_serve(address, timeout_secs)
 
     # -- Lifecycle --
 

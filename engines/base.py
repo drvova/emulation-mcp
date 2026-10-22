@@ -76,6 +76,11 @@ CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "memory_management": "Unmap regions and change guest page permissions at runtime",
     "breakpoints": "Set execution breakpoints that halt a run for inspection/resume",
     "register_introspection": "Enumerate the full register file with offsets and sizes",
+    "reverse_execution": "Step backwards / travel to any instruction count",
+    "callstack": "Read the current return-address call stack",
+    "disassembly": "Disassemble using the engine's own instruction semantics",
+    "coverage": "Record the set of basic blocks executed (for fuzzing/triage)",
+    "gdb": "Serve a GDB remote stub so a real debugger can attach",
 }
 
 
@@ -212,6 +217,22 @@ class BaseEngine(ABC):
     def disassemble(self, address: int, count: int = 1) -> list[dict[str, Any]]:
         """Disassemble `count` instructions from `address`. 'disassembly' capability."""
         raise NotImplementedError(f"Native disassembly is not supported by the '{self.engine_type}' engine")
+
+    def enable_coverage(self) -> None:
+        """Start recording executed basic blocks. 'coverage' capability."""
+        raise NotImplementedError(f"Coverage is not supported by the '{self.engine_type}' engine")
+
+    def get_coverage(self) -> list[int]:
+        """Return the sorted set of basic-block addresses executed. 'coverage' capability."""
+        raise NotImplementedError(f"Coverage is not supported by the '{self.engine_type}' engine")
+
+    def clear_coverage(self) -> None:
+        """Clear the recorded coverage set. 'coverage' capability."""
+        raise NotImplementedError(f"Coverage is not supported by the '{self.engine_type}' engine")
+
+    def gdb_serve(self, address: str = "127.0.0.1:1234", timeout_secs: int = 30) -> str:
+        """Serve a GDB remote stub for a debugger to attach. 'gdb' capability."""
+        raise NotImplementedError(f"A GDB stub is not supported by the '{self.engine_type}' engine")
 
     def hook_remove(self, hook_id: str) -> bool:
         """Remove a hook by ID. Returns True if removed."""

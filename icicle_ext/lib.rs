@@ -1,5 +1,7 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use icicle_cpu::mem::{Mapping, MemError, perm};
 use icicle_cpu::{Cpu, ExceptionCode, ValueSource, VmExit};
 use pyo3::prelude::*;
@@ -240,6 +242,8 @@ pub struct Icicle {
     regs: HashMap<String, NamedRegister>,
     // Named snapshots kept alive on the Python side (index == handle).
     snapshots: Vec<icicle_vm::Snapshot>,
+    // Set of basic-block addresses executed, when coverage is enabled.
+    coverage: Option<Rc<RefCell<HashSet<u64>>>>,
 }
 
 /// Map a core VmExit to the Python-facing RunStatus enum.
@@ -453,6 +457,7 @@ impl Icicle {
             vm,
             regs,
             snapshots: Vec::new(),
+            coverage: None,
         })
     }
 
@@ -714,6 +719,106 @@ impl Icicle {
         // Disjoint field borrows: &mut self.vm.env (receiver) and &mut self.vm.cpu (arg).
         self.vm.env.load(&mut self.vm.cpu, path.as_bytes())
             .map_err(|e| PyException::new_err(format!("linux_load failed: {e}")))
+    }
+
+    // ---- Coverage (block-level) ----
+
+    /// Start recording the set of basic-block addresses that execute. Must be
+    /// called before running (instrumentation is injected as blocks are lifted).
+    pub fn enable_coverage(&mut self) {
+        if self.coverage.is_some() {
+            return;
+        }
+        let set = Rc::new(RefCell::new(HashSet::new()));
+        let sink = set.clone();
+        let hook = self.vm.cpu.add_hook(Box::new(move |_cpu: &mut Cpu, addr: u64| {
+            sink.borrow_mut().insert(addr);
+        }));
+        icicle_vm::injector::register_block_hook_injector(&mut self.vm, 0, u64::MAX, hook);
+        self.coverage = Some(set);
+    }
+
+    /// Whether coverage recording is enabled.
+    pub fn coverage_enabled(&self) -> bool {
+        self.coverage.is_some()
+    }
+
+    /// Sorted list of basic-block addresses executed since coverage was enabled.
+    pub fn get_coverage(&self) -> Vec<u64> {
+        match &self.coverage {
+            Some(set) => {
+                let mut v: Vec<u64> = set.borrow().iter().copied().collect();
+                v.sort_unstable();
+                v
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Number of distinct basic blocks executed.
+    pub fn coverage_count(&self) -> usize {
+        self.coverage.as_ref().map_or(0, |s| s.borrow().len())
+    }
+
+    /// Clear the recorded coverage set (instrumentation stays installed).
+    pub fn clear_coverage(&mut self) {
+        if let Some(set) = &self.coverage {
+            set.borrow_mut().clear();
+        }
+    }
+
+    // ---- GDB remote stub ----
+
+    /// Serve a GDB remote stub on `addr` (e.g. "127.0.0.1:1234"). Waits up to
+    /// `timeout_secs` for a single GDB client to connect, then serves that
+    /// session (blocking) until the client detaches. Attach from another
+    /// terminal with: gdb -ex "target remote <addr>".
+    ///
+    /// This blocks the calling session for the duration of the debug session;
+    /// it is meant to be invoked deliberately for interactive debugging.
+    #[pyo3(signature = (addr = "127.0.0.1:1234".to_string(), timeout_secs = 30))]
+    pub fn gdb_serve(&mut self, addr: String, timeout_secs: u64) -> PyResult<String> {
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind(&addr)
+            .map_err(|e| PyException::new_err(format!("Failed to bind {addr}: {e}")))?;
+        listener.set_nonblocking(true)
+            .map_err(|e| PyException::new_err(format!("{e}")))?;
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let stream = loop {
+            match listener.accept() {
+                Ok((s, _peer)) => {
+                    s.set_nonblocking(false).ok();
+                    break s;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(PyException::new_err(format!(
+                            "No GDB client connected to {addr} within {timeout_secs}s"
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(PyException::new_err(format!("accept error: {e}"))),
+            }
+        };
+
+        use target_lexicon::Architecture as A;
+        let result = match self.vm.cpu.arch.triple.architecture {
+            A::X86_64 => icicle_gdb::run(stream, &mut icicle_gdb::X64Stub::new(&mut self.vm)),
+            A::Arm(_) => icicle_gdb::run(stream, &mut icicle_gdb::ArmStub::new(&mut self.vm)),
+            A::Mips32(_) => icicle_gdb::run(stream, &mut icicle_gdb::Mips32Stub::new(&mut self.vm)),
+            A::Msp430 => icicle_gdb::run(stream, &mut icicle_gdb::Msp430Stub::new(&mut self.vm)),
+            other => {
+                return Err(PyException::new_err(format!(
+                    "GDB stub unsupported for architecture: {other}"
+                )))
+            }
+        };
+        result
+            .map(|_| format!("GDB session on {addr} ended"))
+            .map_err(|e| PyException::new_err(format!("GDB session error: {e}")))
     }
 }
 

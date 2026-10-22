@@ -115,6 +115,8 @@ class TestUnicornThroughServer(unittest.TestCase):
                 _fn(server.emu_goto_icount)(sid, 0),
                 _fn(server.emu_callstack)(sid),
                 _fn(server.emu_disassemble)(sid, "0x1000000", 1),
+                _fn(server.emu_coverage)(sid, "enable"),
+                _fn(server.emu_gdb_serve)(sid, "127.0.0.1:54998", 1),
             ):
                 self.assertTrue(out.startswith("Error:"), out)
         finally:
@@ -223,6 +225,18 @@ class TestExtendedIcicleTools(unittest.TestCase):
             self.assertIn("icount=2", back)
             goto = _fn(server.emu_goto_icount)(sid, 1)
             self.assertIn("icount=1", goto)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+    def test_coverage_via_server(self):
+        sid = _new_session(engine="icicle", arch="x86_64")
+        try:
+            self.assertIn("enabled", _fn(server.emu_coverage)(sid, "enable").lower())
+            _fn(server.emu_memory_write)(sid, "0x1000000",
+                                         "b801000000" "85c0" "7401" "90" "90")
+            _fn(server.emu_run)(sid, "0x1000000", "0x100000b")
+            out = _fn(server.emu_coverage)(sid, "get")
+            self.assertIn("Covered basic blocks", out)
         finally:
             _fn(server.emu_close_session)(sid)
 
