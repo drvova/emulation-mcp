@@ -19,11 +19,16 @@ angr>=9.2
 #
 # Prebuilt wheels are published for CPython 3.9 and 3.10 only (Linux wheels are
 # manylinux_2_39, i.e. glibc >= 2.39 / Ubuntu 24.04-era).  On those interpreters
-# `pip install sogen` just works.  On other Python versions it builds from the
-# sdist (CMake + a C++/Rust toolchain); disable the GUI/audio deps to avoid the
-# SDL3 X11 build requirements:
-#   pip install sogen --config-settings=cmake.define.SOGEN_ENABLE_SDL3=OFF \
-#                      --config-settings=cmake.define.SOGEN_BUILD_TOOLS=OFF
+# `pip install sogen` just works.  On any other Python version it builds from
+# the sdist (CMake + a C++/Rust toolchain).  Use the helper, which picks a wheel
+# when one exists and otherwise does the source build with Sogen's GUI/audio
+# (SDL3) and standalone tools turned off (they are not needed by the Python
+# binding and otherwise require X11/audio dev packages):
+#   ./scripts/build-sogen.sh /path/to/your/venv/bin/python
+# It is equivalent to, for a source build:
+#   pip install sogen --no-binary sogen \
+#       --config-settings=cmake.define.SOGEN_ENABLE_SDL3=OFF \
+#       --config-settings=cmake.define.SOGEN_BUILD_TOOLS=OFF
 #
 # Windows emulation also needs a prepared emulation root (system DLLs +
 # registry): download https://sogen.dev/root.zip, extract it, and pass its path

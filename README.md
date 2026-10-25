@@ -167,9 +167,9 @@ show which are active).
 - **Register introspection** — `emu_list_registers` dumps the full register file
 - Capabilities are feature-detected at session creation, so a session advertises
   only what the installed Sogen build actually exposes
-- Install: prebuilt wheels are CPython 3.9/3.10 only; on other interpreters build
-  from source with the SDL3/tools CMake options off (see
-  `requirements-optional.txt`). Windows needs an emulation root
+- Install with the helper `./scripts/build-sogen.sh /path/to/venv/bin/python` —
+  it installs the prebuilt wheel on CPython 3.9/3.10 and otherwise builds from
+  source with the SDL3/tools CMake options off. Windows needs an emulation root
   (`https://sogen.dev/root.zip`); Linux can use the host `/`. Sogen is GPL-2.0-only
 
 ### Shared features

@@ -27,11 +27,16 @@ them and diff the result. Qiling and Sogen are OS-level emulators with their own
 layouts.
 
 **Installing Sogen:** prebuilt wheels exist for CPython 3.9 and 3.10 only; on
-other interpreters it builds from source (CMake + C++/Rust), and you should
-disable its GUI/audio deps to skip the SDL3 X11 build requirements —
-`pip install sogen --config-settings=cmake.define.SOGEN_ENABLE_SDL3=OFF
---config-settings=cmake.define.SOGEN_BUILD_TOOLS=OFF`. Windows emulation needs a
-prepared emulation root (system DLLs + registry, e.g.
+other interpreters it builds from source (CMake + C++/Rust). Use the helper,
+which picks a wheel when one exists and otherwise does the source build with the
+SDL3 GUI/audio and standalone tools turned off (so no X11/audio dev packages are
+needed):
+
+```bash
+./scripts/build-sogen.sh /path/to/your/venv/bin/python
+```
+
+Windows emulation needs a prepared emulation root (system DLLs + registry, e.g.
 `https://sogen.dev/root.zip`); Linux emulation can use the host `/`. Sogen is
 GPL-2.0-only and, like every engine here, is optional and loaded lazily — the
 server runs without it. See `requirements-optional.txt`.
