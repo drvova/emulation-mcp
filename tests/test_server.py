@@ -51,7 +51,7 @@ def _new_session(**kwargs) -> str:
 
 class TestEngineRegistry(unittest.TestCase):
     def test_known_engines(self):
-        self.assertEqual(set(engines.ENGINE_NAMES), {"unicorn", "qiling", "icicle", "angr"})
+        self.assertEqual(set(engines.ENGINE_NAMES), {"unicorn", "qiling", "icicle", "angr", "sogen"})
 
     def test_unicorn_installed(self):
         self.assertTrue(engines.is_installed("unicorn"))
@@ -82,6 +82,7 @@ class TestListEnginesTool(unittest.TestCase):
         self.assertIn("qiling", out)
         self.assertIn("icicle", out)
         self.assertIn("angr", out)
+        self.assertIn("sogen", out)
 
     def test_unknown_engine_rejected(self):
         out = _fn(server.emu_create_session)(engine="bochs", arch="x86_64")

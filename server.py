@@ -645,10 +645,11 @@ def emu_create_session(
 ) -> str:
     """Create a new emulation session.
 
-    engine: one of "unicorn", "qiling", "icicle", "angr" (see emu_list_engines).
+    engine: one of "unicorn", "qiling", "icicle", "angr", "sogen" (see emu_list_engines).
       - unicorn / icicle: CPU emulators for shellcode & code snippets.
       - qiling: full binary emulation with OS services.
       - angr: symbolic execution (shellcode mode, or binary mode with binary_path).
+      - sogen: Windows/Linux user-mode emulator loading real system libraries.
     arch: Architecture string - "x86", "x86_64", "arm", "arm_thumb", "arm64", "mips",
       "mips_le", and (icicle/angr) "riscv64", "ppc", "ppc64", etc. Optional for angr in
       binary mode (detected from the binary).
@@ -661,6 +662,12 @@ def emu_create_session(
       args: Command-line arguments for the binary.
     For angr binary mode:
       binary_path: Path to the ELF/PE binary (no rootfs needed).
+    For Sogen:
+      binary_path: PE/ELF to run (optional; omit for an empty emulator).
+      rootfs: the emulation root -- a prepared tree of system DLLs + registry for
+        Windows (e.g. https://sogen.dev/root.zip); Linux defaults to the host '/'.
+      ostype: "windows" or "linux".
+      engine_options: {"backend": "unicorn"|"icicle"} selects the CPU backend.
 
     engine_options: Optional dict of engine-specific constructor options. For
       Icicle these map onto the VM knobs, e.g. {"jit": true} (faster, but only
@@ -698,6 +705,16 @@ def emu_create_session(
             eng = engine_cls(arch=arch, binary_path=binary_path, **opts)
             if enable_trace:
                 eng.enable_tracing()
+        elif engine == "sogen":
+            # Sogen: Windows/Linux user-mode. binary_path optional (empty ->
+            # create_empty); rootfs maps to the emulation root. Backend and
+            # other knobs come through engine_options.
+            if binary_path:
+                _validate_binary_path(binary_path)  # EM-1
+            eng = engine_cls(
+                arch=arch or "x86_64", binary_path=binary_path, rootfs=rootfs,
+                ostype=ostype, args=args or [], enable_trace=enable_trace, **opts,
+            )
         else:
             if not arch:
                 return f"Error: arch is required for the '{engine}' engine."

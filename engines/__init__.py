@@ -44,6 +44,13 @@ ENGINE_SPECS: dict[str, EngineSpec] = {
         "Symbolic execution: make registers/memory symbolic, explore paths to a target "
         "address, and solve for the inputs that reach it.",
     ),
+    "sogen": EngineSpec(
+        "sogen", "sogen_engine", "SogenEngine", "sogen", "sogen",
+        "High-performance Windows and Linux user-mode emulator. Loads real PE/ELF "
+        "binaries and the genuine system libraries (ntdll/kernel32 on Windows), with a "
+        "selectable CPU backend (Unicorn or Icicle). Needs a prepared emulation root "
+        "for Windows (system DLLs + registry); Linux can run against the host '/'.",
+    ),
 }
 
 ENGINE_NAMES: tuple[str, ...] = tuple(ENGINE_SPECS)

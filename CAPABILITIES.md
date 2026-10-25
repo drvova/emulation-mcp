@@ -19,54 +19,74 @@ have it.
 | **Icicle** | SLEIGH-based CPU emulation | shellcode, Linux ELF | also RISC-V 32/64, PowerPC 32/64, MSP430; the deep features need the extended binding (`icicle_ext/`) |
 | **angr** | Symbolic execution + static analysis | shellcode, binary | the only engine with `symbolic`, CFG/decompiler/data-flow |
 | **Qiling** | Full binary / OS emulation | binary + rootfs | Linux (tested); Windows/UEFI/DOS/macOS/FreeBSD accepted with a matching rootfs |
+| **Sogen** | Windows / Linux user-mode emulation | PE/ELF + emulation root | loads the **real** system libraries (ntdll/kernel32/…); selectable Unicorn or Icicle CPU backend; x86-64 and ARM64 guests |
 
-The CPU engines share one memory layout, so addresses are interchangeable and
-`emu_compare_engines` can run the same shellcode on two of them and diff the
-result.
+The CPU engines (Unicorn, Icicle, angr) share one memory layout, so addresses are
+interchangeable and `emu_compare_engines` can run the same shellcode on two of
+them and diff the result. Qiling and Sogen are OS-level emulators with their own
+layouts.
+
+**Installing Sogen:** prebuilt wheels exist for CPython 3.9 and 3.10 only; on
+other interpreters it builds from source (CMake + C++/Rust), and you should
+disable its GUI/audio deps to skip the SDL3 X11 build requirements —
+`pip install sogen --config-settings=cmake.define.SOGEN_ENABLE_SDL3=OFF
+--config-settings=cmake.define.SOGEN_BUILD_TOOLS=OFF`. Windows emulation needs a
+prepared emulation root (system DLLs + registry, e.g.
+`https://sogen.dev/root.zip`); Linux emulation can use the host `/`. Sogen is
+GPL-2.0-only and, like every engine here, is optional and loaded lazily — the
+server runs without it. See `requirements-optional.txt`.
 
 ## Capability matrix
 
-| Capability | unicorn | qiling | icicle | angr |
-|---|:--:|:--:|:--:|:--:|
-| shellcode | ✓ | | ✓ | ✓ |
-| binary loading | | ✓ | | ✓ |
-| OS emulation | | ✓ | ✓ † | |
-| syscall / API hooks | | ✓ | | |
-| address hooks | ✓ | ✓ | ✓ | ✓ |
-| instruction trace | ✓ | | ✓ | ✓ |
-| memory trace | ✓ | | | |
-| snapshots | ✓ | ✓ | ✓ | ✓ |
-| memory management | | | ✓ | |
-| breakpoints | | | ✓ | |
-| register introspection | | ✓ | ✓ | |
-| native disassembly | | ✓ | ✓ † | |
-| callback hooks | | ✓ | ✓ † | |
-| memory hooks | | ✓ | ✓ † | |
-| reverse execution | | | ✓ † | |
-| call stack | | | ✓ † | |
-| wide registers | | | ✓ † | |
-| block coverage | | | ✓ † | |
-| GDB remote stub | | | ✓ † | |
-| p-code IL | | | ✓ † | |
-| MMIO regions | | | ✓ † | |
-| compare logging (RedQueen) | | | ✓ † | |
-| symbolization | | | ✓ † | |
-| filesystem mapping | | ✓ | | |
-| stdin / stdout I/O | | ✓ | | |
-| syscall statistics | | ✓ | | |
-| instruction hooks | | ✓ | | |
-| multithreading | | ✓ | | |
-| symbolic execution | | | | ✓ |
-| constraints / solver | | | | ✓ |
-| CFG / functions | | | | ✓ |
-| function calls | | | | ✓ |
-| decompiler | | | | ✓ |
-| function hooks | | | | ✓ |
-| event inspection | | | | ✓ |
-| data-flow analyses | | | | ✓ |
+| Capability | unicorn | qiling | icicle | angr | sogen |
+|---|:--:|:--:|:--:|:--:|:--:|
+| shellcode | ✓ | | ✓ | ✓ | |
+| binary loading | | ✓ | | ✓ | ✓ |
+| OS emulation | | ✓ | ✓ † | | ✓ |
+| syscall / API hooks | | ✓ | | | ✓ |
+| address hooks | ✓ | ✓ | ✓ | ✓ | ✓ |
+| instruction trace | ✓ | | ✓ | ✓ | |
+| memory trace | ✓ | | | | |
+| snapshots | ✓ | ✓ | ✓ | ✓ | ✓ |
+| memory management | | | ✓ | | |
+| breakpoints | | | ✓ | | ✓ ‡ |
+| register introspection | | ✓ | ✓ | | ✓ |
+| native disassembly | | ✓ | ✓ † | | ✓ ‡ |
+| callback hooks | | ✓ | ✓ † | | ✓ |
+| memory hooks | | ✓ | ✓ † | | ✓ |
+| reverse execution | | | ✓ † | | |
+| call stack | | | ✓ † | | |
+| wide registers | | | ✓ † | | |
+| block coverage | | | ✓ † | | |
+| GDB remote stub | | | ✓ † | | |
+| p-code IL | | | ✓ † | | |
+| MMIO regions | | | ✓ † | | |
+| compare logging (RedQueen) | | | ✓ † | | |
+| symbolization | | | ✓ † | | |
+| filesystem mapping | | ✓ | | | |
+| stdin / stdout I/O | | ✓ | | | ✓ § |
+| syscall statistics | | ✓ | | | |
+| instruction hooks | | ✓ | | | ✓ |
+| multithreading | | ✓ | | | |
+| symbolic execution | | | | ✓ | |
+| constraints / solver | | | | ✓ | |
+| CFG / functions | | | | ✓ | |
+| function calls | | | | ✓ | |
+| decompiler | | | | ✓ | |
+| function hooks | | | | ✓ | |
+| event inspection | | | | ✓ | |
+| data-flow analyses | | | | ✓ | |
 
 † Icicle feature available with the extended binding (`icicle_ext/`, built from
 source). The stock `icicle-emu` wheel supports the un-daggered Icicle rows.
+
+‡ Sogen guest ARM64 is supported alongside x86-64. Native disassembly and
+breakpoints come from Sogen's debugger facade, which is present on Linux builds;
+the engine feature-detects them and advertises the capability only when the
+installed binding exposes it.
+
+§ Sogen I/O is stdout/stderr capture (via `on_stdout`/`on_stderr` callbacks);
+feeding stdin is not wired through this engine.
 
 ## Tools by category
 
@@ -127,6 +147,20 @@ source). The stock `icicle-emu` wheel supports the un-daggered Icicle rows.
 - `emu_set_stdin` / `emu_capture_output` — feed stdin, capture stdout/stderr (`'io'`)
 - `emu_syscall_stats` — syscall histogram + observed strings
 - `emu_list_threads` — thread listing (multithread mode)
+
+### Sogen Windows/Linux user-mode
+Sogen drives the shared tools: `emu_create_session` (`engine="sogen"`,
+`ostype="windows"|"linux"`, `binary_path`, `rootfs`=emulation root,
+`engine_options={"backend": "unicorn"|"icicle"}`), then `emu_run` / `emu_step`,
+`emu_memory_read` / `emu_memory_write`, `emu_registers_read` /
+`emu_register_write`, `emu_snapshot_*`. In addition it exposes:
+- `emu_list_registers` — full x86-64 / ARM64 register file (`'register_introspection'`)
+- `emu_hook_address` and the callback hooks (`add_code_hook` / `add_block_hook` /
+  `add_mem_hook` / `add_intr_hook` / `hook_insn`) via `emu_eval` (`'callback_hooks'`, `'memory_hooks'`)
+- `emu_hook_api` — intercept a Windows API (`kernel32!Sleep`) or Linux symbol (`'api_hooks'`)
+- `emu_capture_output` — capture the guest's stdout/stderr (`'io'`)
+- `emu_disassemble` / `emu_breakpoint_add` — when the Linux debugger facade is present
+- `emu_memory_maps` / `emu_read_string` — region listing and string reads
 
 ### Symbolic execution & static analysis (angr)
 - `emu_set_symbolic_register` / `emu_set_symbolic_memory` — make inputs symbolic

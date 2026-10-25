@@ -1,6 +1,6 @@
 # emulation-mcp
 
-MCP server for CPU and binary emulation in reverse engineering workflows. Four
+MCP server for CPU and binary emulation in reverse engineering workflows. Five
 pluggable backends cover everything from raw shellcode to full binaries to
 symbolic execution; each is loaded lazily, so you only install the ones you use.
 
@@ -135,6 +135,35 @@ show which are active).
   the bottom-level primitive for watchpoints, taint and custom analyses
 - Works on raw shellcode (shellcode mode) or whole binaries (binary mode)
 - Also supports the ordinary concrete workflow (run, step, read state, snapshots)
+
+### Sogen — Windows / Linux user-mode emulation *(new)*
+- Runs real PE (and ELF) binaries by loading the **genuine** system libraries
+  (ntdll/kernel32/user32 on Windows, the ELF loader + libc on Linux) and
+  emulating at the CPU + syscall level — so PE loading, SEH, the PEB/TEB,
+  threading, the registry and the filesystem behave as the real loader would
+- **Selectable CPU backend** — `engine_options={"backend": "unicorn"}` (default)
+  or `{"backend": "icicle"}`; x86-64 and ARM64 guests. The `icicle` backend also
+  needs Ghidra's SLEIGH specs reachable from the working directory, so `unicorn`
+  is the reliable default
+- Create a session with `engine="sogen"`, `ostype="windows"|"linux"`, a
+  `binary_path` (or omit it for an empty emulator) and `rootfs` = the emulation
+  root. Then `emu_run` / `emu_step`, read/write memory and registers, and
+  `emu_snapshot_*` (snapshots use Sogen's `serialize_state`/`deserialize_state`)
+- **API / symbol interception** — `engine.hook_api("kernel32!Sleep", fn)` on
+  Windows or `engine.hook_api("libc!strcmp", fn)` on Linux (via `emu_eval`)
+- **Callback hooks** — per-instruction (`add_code_hook`), basic-block
+  (`add_block_hook`), memory read/write over a range (`add_mem_hook`),
+  interrupt (`add_intr_hook`) and instruction-type (`hook_insn`) callbacks
+- **I/O capture** — `emu_capture_output` tees the guest's stdout/stderr
+- **Register introspection** — `emu_list_registers` dumps the full register file;
+  on Linux builds the debugger facade also powers `emu_disassemble` and
+  `emu_breakpoint_add`
+- Capabilities are feature-detected at session creation, so a session advertises
+  only what the installed Sogen build actually exposes
+- Install: prebuilt wheels are CPython 3.9/3.10 only; on other interpreters build
+  from source with the SDL3/tools CMake options off (see
+  `requirements-optional.txt`). Windows needs an emulation root
+  (`https://sogen.dev/root.zip`); Linux can use the host `/`. Sogen is GPL-2.0-only
 
 ### Shared features
 - Session management with unique IDs, auto-cleanup after idle timeout

@@ -13,3 +13,24 @@ icicle-emu>=0.0.11
 
 # angr -- symbolic execution (symbolic inputs, path exploration, constraint solving).
 angr>=9.2
+
+# Sogen -- Windows & Linux user-mode emulator (loads real system libraries;
+# selectable Unicorn/Icicle CPU backend).  https://github.com/momo5502/sogen
+#
+# Prebuilt wheels are published for CPython 3.9 and 3.10 only (Linux wheels are
+# manylinux_2_39, i.e. glibc >= 2.39 / Ubuntu 24.04-era).  On those interpreters
+# `pip install sogen` just works.  On other Python versions it builds from the
+# sdist (CMake + a C++/Rust toolchain); disable the GUI/audio deps to avoid the
+# SDL3 X11 build requirements:
+#   pip install sogen --config-settings=cmake.define.SOGEN_ENABLE_SDL3=OFF \
+#                      --config-settings=cmake.define.SOGEN_BUILD_TOOLS=OFF
+#
+# Windows emulation also needs a prepared emulation root (system DLLs +
+# registry): download https://sogen.dev/root.zip, extract it, and pass its path
+# as `rootfs`.  Linux emulation can run against the host '/'.
+#
+# Note: Sogen is licensed GPL-2.0-only.  It is loaded lazily and never vendored,
+# so it is an optional, separately-installed dependency (as with the GPLv2
+# Unicorn/Qiling engines); install it only if that suits your use.  There is no
+# tagged release yet -- pin an exact 0.0.1.devNNNN build.
+# sogen==0.0.1.dev5822
