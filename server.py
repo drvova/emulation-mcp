@@ -39,73 +39,59 @@ mcp = FastMCP(
         "             serves as an independent cross-check of Unicorn (see emu_compare_engines).\n"
         "- 'angr':    Symbolic execution. Make registers/memory symbolic and solve for the\n"
         "             inputs that drive execution to a target address (emu_explore/emu_solve).\n\n"
-        "Typical workflow:\n"
-        "1. Create a session with emu_create_session (pick an engine + arch)\n"
-        "2. For CPU engines: map memory, write code, run\n"
-        "3. For Qiling: point at binary + rootfs, hook syscalls/APIs, run\n"
-        "4. For angr: write code, make inputs symbolic, explore to a target, solve\n"
-        "5. Inspect registers, memory, trace; use snapshots to save/restore state\n\n"
-        "Tool surface: a small generic CORE is advertised (session lifecycle, run/step,\n"
-        "memory/register access) together with the introspection trio -- emu_describe\n"
-        "lists a session's live capabilities and each method's signature, and emu_call\n"
-        "invokes any of them. This reaches the FULL engine API (hooks, snapshots,\n"
-        "symbolization, CFG, fuzzing, ...) without a dedicated tool per capability, which\n"
-        "matters because engines/archs support different subsets. Discover with\n"
-        "emu_describe, then drive with emu_call. Set EMU_EXPOSE_TYPED_TOOLS=1 to also\n"
-        "advertise the full catalog of explicit emu_* verbs."
+        "One tool is advertised: `emu`. Build your own working set on it rather than\n"
+        "expecting a fixed catalog -- engines/archs/models differ in what they support.\n"
+        "  1. emu(action=\"describe\")                      -> installed engines + how to start\n"
+        "  2. emu(action=\"create\", options={...})          -> a session (engine + arch, or\n"
+        "                                                     binary_path + rootfs/ostype)\n"
+        "  3. emu(action=\"describe\", session_id=sid)       -> that engine's live capabilities\n"
+        "                                                     and every method's signature\n"
+        "  4. emu(action=\"call\", session_id=sid, method=..., args=[...], target=\"engine\"|\"native\")\n"
+        "This reaches the FULL engine API (run/step, memory, registers, hooks, snapshots,\n"
+        "disassembly, symbolization, CFG, fuzzing, symbolic execution). Set\n"
+        "EMU_EXPOSE_TYPED_TOOLS=1 to also advertise the full catalog of explicit emu_* verbs."
     ),
 )
 
 sessions = SessionManager()
 
 # ---------------------------------------------------------------------------
-# Tool surface: a lean generic core, advertised by default; the full typed
-# catalog is opt-in.
+# Tool surface: ONE universal tool by default; the typed catalog is opt-in.
 # ---------------------------------------------------------------------------
-# A large fixed catalog of typed tools is the wrong primary interface: every
-# engine/arch/install supports a different subset, and hand-wiring one verb per
-# capability neither scales nor lets a capable model build its own tooling. So
-# by default the server advertises only a small, engine-agnostic CORE and the
-# generic introspection trio (emu_describe / emu_call / emu_eval). A model
-# inspects a session with emu_describe -- which now reports the engine's live
-# capabilities and each method's signature -- and drives the full engine API
-# through emu_call, so the advertised list need not enumerate capabilities that
-# vary per engine.
+# A fixed catalog of typed tools is the wrong primary interface. Engines, archs
+# and installs each support a different subset of capabilities, and models
+# differ in which tools they have and how well they wield them -- so privileging
+# any particular hand-picked set biases the system toward some models and some
+# engines. Instead the server advertises exactly ONE tool by default, `emu`,
+# from which a model builds whatever working set it needs: it discovers a
+# session's live capabilities and method signatures, then invokes them. Nothing
+# about a specific capability is baked into the advertised surface.
 #
 # Set EMU_EXPOSE_TYPED_TOOLS=1 to additionally advertise the whole typed catalog
-# (emu_hook_*, emu_snapshot_*, emu_symbolize, emu_cfg, emu_fuzz, ...) for clients
-# or models that prefer explicit, discoverable verbs. Either way every emu_*
-# function stays defined on this module, so nothing is lost: the un-advertised
-# ones remain reachable via emu_call and importable by tests.
+# (emu_create_session, emu_hook_*, emu_symbolize, emu_cfg, ...) for clients or
+# models that prefer explicit, discoverable verbs. Either way every emu_*
+# function stays defined on this module, so nothing is lost: `emu` dispatches to
+# them, and they remain importable by tests.
 _EXPOSE_TYPED = os.getenv("EMU_EXPOSE_TYPED_TOOLS", "0").strip().lower() not in (
     "", "0", "false", "no", "off",
 )
 
-CORE_TOOLS: frozenset[str] = frozenset({
-    # session lifecycle + discovery
-    "emu_create_session", "emu_list_sessions", "emu_close_session", "emu_list_engines",
-    # execution
-    "emu_run", "emu_step",
-    # raw memory + registers
-    "emu_memory_read", "emu_memory_write", "emu_memory_map",
-    "emu_registers_read", "emu_register_write",
-    # generic introspection + invocation (the composable core)
-    "emu_describe", "emu_call", "emu_eval",
-})
+# The single tool always advertised. Everything else is reached through it.
+ALWAYS_ON: frozenset[str] = frozenset({"emu"})
 
 _mcp_tool = mcp.tool  # the real FastMCP decorator factory
 
 
 def _gated_tool(*dargs, **dkwargs):
-    """Intercept ``@mcp.tool()`` so registration is core/flag gated.
+    """Intercept ``@mcp.tool()`` so only `emu` is advertised by default.
 
-    A tool is advertised over MCP when its function name is in CORE_TOOLS or
-    when EMU_EXPOSE_TYPED_TOOLS is set; otherwise the function is defined on the
-    module but not registered. This keeps the default tool surface small without
-    editing (or losing) any of the typed tools.
+    A tool is advertised over MCP when its function name is in ALWAYS_ON (just
+    `emu`) or when EMU_EXPOSE_TYPED_TOOLS is set; otherwise the function is
+    defined on the module but not registered. This keeps the default surface a
+    single universal tool without editing (or losing) any of the typed tools.
     """
     def deco(fn):
-        if getattr(fn, "__name__", "") in CORE_TOOLS or _EXPOSE_TYPED:
+        if getattr(fn, "__name__", "") in ALWAYS_ON or _EXPOSE_TYPED:
             return _mcp_tool(*dargs, **dkwargs)(fn)
         return fn
     return deco
@@ -3530,6 +3516,94 @@ def emu_eval(session_id: str, code: str) -> str:
         out = buf.getvalue()
         prefix = f"stdout:\n{out.rstrip()}\n" if out else ""
         return f"{prefix}eval error: {type(e).__name__}: {e}"
+
+
+# ===========================================================================
+# The one universal tool
+# ===========================================================================
+
+def _raw(name: str):
+    """Return the underlying function for an emu_* tool, whether or not it was
+    wrapped by @mcp.tool() (so `emu` can call it the same way in either mode)."""
+    fn = globals().get(name)
+    return getattr(fn, "fn", fn)
+
+
+@mcp.tool()
+def emu(
+    action: str = "describe",
+    session_id: str = "",
+    method: str = "",
+    args: list | None = None,
+    kwargs: dict | None = None,
+    target: str = "native",
+    filter: str = "",
+    code: str = "",
+    options: dict | None = None,
+) -> str:
+    """One universal entry point to CPU/binary emulation — build your own tooling on it.
+
+    This is the only tool advertised by default. Rather than a fixed catalog of
+    verbs (which assumes every engine/arch/model supports the same things), you
+    discover a session's real surface and drive it. Everything an engine can do
+    — run, step, memory, registers, hooks, snapshots, disassembly, symbolization,
+    CFG, fuzzing, symbolic execution — is reached through `action="call"`.
+
+    action:
+      - "describe" (default): discover. With no session_id, lists installed
+        engines and how to create a session. With session_id, lists that
+        session's live capabilities and every method's signature + one-line doc
+        (use `filter` to narrow, `target` to pick "native" vs "engine").
+      - "create": create a session. Put the parameters in `options`, e.g.
+        {"engine": "unicorn", "arch": "x86_64"} or
+        {"engine": "sogen", "ostype": "linux", "binary_path": "/path/prog"}.
+        Returns a session_id.
+      - "call": invoke `method` on the session (args/kwargs are JSON; "0x10" ->
+        int, {"hex": ".."}/{"bytes": [..]} -> bytes). `target` is "native" (the
+        underlying emulator object) or "engine" (the wrapper). This is the
+        workhorse — it reaches the full engine API.
+      - "sessions": list active sessions. "close": close `session_id`.
+      - "eval": run Python `code` against the session (off unless the server was
+        started with EMU_ENABLE_EVAL=1); the way to pass Python callables to
+        callback-based APIs (hooks, MMIO).
+
+    Typical flow: emu("describe") -> emu("create", options={...}) ->
+    emu("describe", session_id=sid) -> emu("call", session_id=sid,
+    method="memory_write", args=["0x1000", {"hex": "9090"}], target="engine").
+
+    (Set EMU_EXPOSE_TYPED_TOOLS=1 to also advertise the full catalog of explicit
+    emu_* verbs; they are otherwise reachable only through this tool.)
+    """
+    act = (action or "describe").strip().lower()
+    try:
+        if act == "describe":
+            if not session_id:
+                engines_out = _raw("emu_list_engines")()
+                return (
+                    "emu — one universal tool for CPU/binary emulation.\n\n"
+                    "Start by creating a session, then describe it to see what it can do:\n"
+                    "  emu(action=\"create\", options={\"engine\": \"<name>\", \"arch\": \"<arch>\"})\n"
+                    "  emu(action=\"describe\", session_id=\"<id>\")   # capabilities + method signatures\n"
+                    "  emu(action=\"call\", session_id=\"<id>\", method=\"<name>\", args=[...], target=\"engine\"|\"native\")\n\n"
+                    + engines_out
+                )
+            return _raw("emu_describe")(session_id, target=target, filter=filter)
+        if act == "create":
+            return _raw("emu_create_session")(**(options or {}))
+        if act in ("sessions", "list", "list_sessions"):
+            return _raw("emu_list_sessions")()
+        if act == "close":
+            return _raw("emu_close_session")(session_id)
+        if act == "call":
+            return _raw("emu_call")(session_id, method, args=args, kwargs=kwargs, target=target)
+        if act == "eval":
+            return _raw("emu_eval")(session_id, code)
+        return (f"Error: unknown action '{action}'. Use one of: "
+                "describe, create, call, sessions, close, eval.")
+    except TypeError as e:
+        return f"Error: bad arguments for action '{act}': {e}"
+    except Exception as e:
+        return f"emu error: {type(e).__name__}: {e}"
 
 
 # ===========================================================================

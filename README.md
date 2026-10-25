@@ -338,38 +338,43 @@ any engine that can trace, so it works on Unicorn too. Memory is reset between
 runs on both engines (Unicorn snapshots now capture mapped memory, not just
 registers).
 
-### Tool surface: lean core + introspection
+### Tool surface: one universal tool
 
-A fixed catalog of ~70 typed verbs is the wrong primary interface — engines,
-archs and installs each support a different subset, and one hand-wired verb per
-capability neither scales nor lets a capable model build its own tooling. So by
-**default** the server advertises only a small, engine-agnostic **core** plus
-three reflective tools, and the model discovers and composes the rest:
+A fixed catalog of ~70 typed verbs is the wrong interface — engines, archs and
+installs each support a different subset, and models differ in which tools they
+have and how well they use them, so privileging any hand-picked set biases the
+system. By **default the server advertises exactly one tool, `emu`**, and the
+model builds whatever working set it needs on top of it:
 
-- **Core (always advertised):** session lifecycle (`emu_create_session`,
-  `emu_list_sessions`, `emu_close_session`, `emu_list_engines`), execution
-  (`emu_run`, `emu_step`), raw memory (`emu_memory_read`/`_write`/`_map`) and
-  registers (`emu_registers_read`, `emu_register_write`).
-- `emu_describe` — a session's **live capabilities** and every method's
+```
+emu(action="describe")                       # installed engines + how to start
+emu(action="create", options={"engine": "unicorn", "arch": "x86_64"})   # -> session_id
+emu(action="describe", session_id=sid)        # that engine's LIVE capabilities + method signatures
+emu(action="call", session_id=sid, method="memory_write",
+    args=["0x1000", {"hex": "9090"}], target="engine")
+emu(action="sessions") | emu(action="close", session_id=sid) | emu(action="eval", ...)
+```
+
+- `describe` reports a session's **live capabilities** and every method's
   **signature** + one-line doc (from `inspect`, or the docstring for native
   methods), for the underlying emulator object (`target="native"`: icicle VM,
   unicorn `Uc`, qiling `Ql`, angr `SimState`, sogen `Emulator`) or the wrapper
-  (`target="engine"`). Start here to see what an engine/arch supports.
-- `emu_call` — invoke any of those methods (or read any attribute) by name.
-  Arguments are JSON with convenience coercions: `"0x1000"` → int,
-  `{"hex": "deadbeef"}` or `{"bytes": [...]}` → bytes. Private members are
-  blocked. This reaches the **full** engine API (hooks, snapshots,
-  symbolization, CFG, fuzzing, …) without a dedicated tool per capability.
-- `emu_eval` — run a Python snippet against the session (`engine` and `native`
-  in scope). This executes arbitrary Python in the server process, so it is
-  **off by default**; enable it only in a trusted local setup by starting the
-  server with `EMU_ENABLE_EVAL=1`.
+  (`target="engine"`). It's how the model learns what an engine/arch supports.
+- `call` invokes any of those methods (JSON args; `"0x1000"` → int,
+  `{"hex": ".."}`/`{"bytes": [..]}` → bytes; private members blocked). This
+  reaches the **full** engine API (run/step, memory, registers, hooks,
+  snapshots, symbolization, CFG, fuzzing, symbolic execution) with no dedicated
+  tool per capability.
+- `eval` runs a Python snippet against the session (`engine`/`native` in scope);
+  arbitrary code, so **off by default** — start the server with
+  `EMU_ENABLE_EVAL=1` to allow it (the way to pass Python callables to
+  callback-based APIs like hooks/MMIO).
 
 Set **`EMU_EXPOSE_TYPED_TOOLS=1`** to additionally advertise the full catalog of
 explicit `emu_*` verbs (for clients/models that prefer discoverable, typed
 verbs). The flag only changes what is **advertised**: every `emu_*` function
-exists regardless and stays reachable through `emu_call`, so no capability is
-lost when the catalog is hidden — `emu_describe` + `emu_call` cover it.
+exists regardless, `emu` dispatches to it, and it stays reachable through
+`emu(action="call", …)`, so no capability is lost when the catalog is hidden.
 
 ## Architecture
 

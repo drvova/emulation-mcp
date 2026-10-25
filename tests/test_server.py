@@ -833,43 +833,53 @@ class TestQilingThroughServer(unittest.TestCase):
 
 
 class TestToolSurface(unittest.TestCase):
-    """The advertised surface is a lean generic core; the typed catalog is opt-in."""
+    """One universal `emu` tool is advertised by default; the catalog is opt-in."""
 
     def _advertised(self):
         import asyncio
         return {t.name for t in asyncio.run(server.mcp.list_tools())}
 
-    def test_core_always_advertised(self):
+    def test_only_emu_advertised_by_default(self):
         names = self._advertised()
-        self.assertTrue(server.CORE_TOOLS <= names,
-                        f"missing core tools: {server.CORE_TOOLS - names}")
-        # The composable core must include introspection + invocation.
-        for t in ("emu_describe", "emu_call", "emu_create_session", "emu_run"):
-            self.assertIn(t, names)
-
-    def test_typed_tools_gated_by_default(self):
-        names = self._advertised()
+        self.assertIn("emu", names)
         if server._EXPOSE_TYPED:
-            # Flag on: the full catalog is advertised.
+            # Flag on: the full catalog is advertised alongside emu.
             self.assertIn("emu_symbolize", names)
+            self.assertIn("emu_create_session", names)
         else:
-            # Flag off (default): only the core is advertised...
-            self.assertEqual(names, set(server.CORE_TOOLS))
-            self.assertNotIn("emu_symbolize", names)
-        # ...but every typed function stays defined on the module either way,
-        # so it is reachable via emu_call and importable by tests.
+            # Flag off (default): exactly one tool.
+            self.assertEqual(names, {"emu"})
+        # Every typed function stays defined on the module regardless, so emu
+        # can dispatch to it and tests can import it.
+        self.assertTrue(callable(_fn(server.emu_create_session)))
         self.assertTrue(callable(_fn(server.emu_symbolize)))
 
-    def test_describe_reports_capabilities_and_signatures(self):
-        sid = _new_session(engine="unicorn", arch="x86_64")
+    def test_emu_describe_bootstrap_lists_engines(self):
+        out = _fn(server.emu)(action="describe")
+        self.assertIn("emu", out)
+        self.assertIn("unicorn", out)      # emu_list_engines output is included
+
+    def test_emu_create_describe_call_roundtrip(self):
+        out = _fn(server.emu)(action="create", options={"engine": "unicorn", "arch": "x86_64"})
+        self.assertTrue(out.startswith("Session created:"), out)
+        sid = out.split("Session created:", 1)[1].split()[0]
         try:
-            out = _fn(server.emu_describe)(sid, target="engine", filter="memory")
-            self.assertIn("Capabilities (", out)
-            # A real, typed signature (not a bare "name()") must appear.
-            self.assertIn("memory_read(", out)
-            self.assertIn("-> bytes", out)
+            desc = _fn(server.emu)(action="describe", session_id=sid, target="engine", filter="memory")
+            self.assertIn("Capabilities (", desc)
+            self.assertIn("memory_read(", desc)      # real signature, not "name()"
+            # drive the engine through the one tool
+            _fn(server.emu)(action="call", session_id=sid, method="memory_map",
+                            args=["0x1000", 4096], target="engine")
+            _fn(server.emu)(action="call", session_id=sid, method="memory_write",
+                            args=["0x1000", {"hex": "9090"}], target="engine")
+            r = _fn(server.emu)(action="call", session_id=sid, method="memory_read",
+                                args=["0x1000", 2], target="engine")
+            self.assertIn("9090", r.lower())
         finally:
-            _fn(server.emu_close_session)(sid)
+            _fn(server.emu)(action="close", session_id=sid)
+
+    def test_emu_unknown_action(self):
+        self.assertIn("unknown action", _fn(server.emu)(action="frobnicate"))
 
 
 if __name__ == "__main__":
