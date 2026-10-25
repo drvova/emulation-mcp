@@ -43,6 +43,34 @@ def _fn(tool):
     return getattr(tool, "fn", tool)
 
 
+# Isolate the persistent code harness so tests never touch the real
+# ~/.emulation-mcp/harness: point it at a throwaway dir and ensure code is on.
+import tempfile as _tempfile
+import shutil as _shutil
+
+_HARNESS_TMP = None
+_SAVED_HARNESS_DIR = None
+_SAVED_CODE_ENABLED = None
+
+
+def setUpModule():
+    global _HARNESS_TMP, _SAVED_HARNESS_DIR, _SAVED_CODE_ENABLED
+    _HARNESS_TMP = _tempfile.mkdtemp(prefix="emu-harness-test-")
+    _SAVED_HARNESS_DIR = server.HARNESS_DIR
+    _SAVED_CODE_ENABLED = server.CODE_ENABLED
+    server.HARNESS_DIR = _HARNESS_TMP
+    server.CODE_ENABLED = True
+    server._HARNESS_NS.clear()
+
+
+def tearDownModule():
+    server.HARNESS_DIR = _SAVED_HARNESS_DIR
+    server.CODE_ENABLED = _SAVED_CODE_ENABLED
+    server._HARNESS_NS.clear()
+    if _HARNESS_TMP:
+        _shutil.rmtree(_HARNESS_TMP, ignore_errors=True)
+
+
 def _new_session(**kwargs) -> str:
     out = _fn(server.emu_create_session)(**kwargs)
     assert out.startswith("Session created:"), out
@@ -245,28 +273,30 @@ class TestReflectiveTools(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
-    def test_eval_disabled_by_default(self):
+    def test_eval_refused_when_code_disabled(self):
+        # Code execution is ON by default now; when turned off it refuses clearly.
+        saved = server.CODE_ENABLED
+        server.CODE_ENABLED = False
         sid = _new_session(engine="unicorn", arch="x86_64")
         try:
             out = _fn(server.emu_eval)(sid, "result = 1 + 1")
             self.assertIn("disabled", out.lower())
         finally:
             _fn(server.emu_close_session)(sid)
+            server.CODE_ENABLED = saved
 
     def test_eval_when_enabled(self):
-        orig = server.ENABLE_EVAL
-        server.ENABLE_EVAL = True
+        # setUpModule enables code; emu_eval shares the persistent harness.
         sid = _new_session(engine="unicorn", arch="x86_64")
         try:
             out = _fn(server.emu_eval)(sid,
                 "engine.memory_write(0x1000000, bytes.fromhex('9090'))\n"
                 "print('ok')\n"
-                "result = engine.memory_read(0x1000000, 2).hex()")
+                "engine.memory_read(0x1000000, 2).hex()")
             self.assertIn("ok", out)
             self.assertIn("9090", out)
         finally:
             _fn(server.emu_close_session)(sid)
-            server.ENABLE_EVAL = orig
 
 
 @unittest.skipUnless(ICICLE_EXTENDED, "extended Icicle binding (icicle_ext/) not installed")
@@ -833,11 +863,15 @@ class TestQilingThroughServer(unittest.TestCase):
 
 
 class TestToolSurface(unittest.TestCase):
-    """One universal `emu` tool is advertised by default; the catalog is opt-in."""
+    """One `emu` code tool is advertised; the model builds its own tooling in it."""
 
     def _advertised(self):
         import asyncio
         return {t.name for t in asyncio.run(server.mcp.list_tools())}
+
+    def _create(self, **opts):
+        out = _fn(server.emu)(code=f"create(**{opts!r})")
+        return out.split("result:", 1)[1].strip().strip("'\"")
 
     def test_only_emu_advertised_by_default(self):
         names = self._advertised()
@@ -847,82 +881,60 @@ class TestToolSurface(unittest.TestCase):
             self.assertIn("emu_symbolize", names)
             self.assertIn("emu_create_session", names)
         else:
-            # Flag off (default): exactly one tool.
+            # Default: exactly one tool.
             self.assertEqual(names, {"emu"})
-        # Every typed function stays defined on the module regardless, so emu
-        # can dispatch to it and tests can import it.
+        # Every typed function stays defined on the module regardless, so it is
+        # reachable (via code / emu_call) and importable by tests.
         self.assertTrue(callable(_fn(server.emu_create_session)))
         self.assertTrue(callable(_fn(server.emu_symbolize)))
 
-    def test_emu_describe_bootstrap_lists_engines(self):
-        out = _fn(server.emu)(action="describe")
-        self.assertIn("emu", out)
-        self.assertIn("unicorn", out)      # emu_list_engines output is included
+    def test_empty_code_returns_manual_and_engines(self):
+        out = _fn(server.emu)(code="")
+        self.assertIn("one tool", out.lower())
+        self.assertIn("create(", out)          # the manual documents the vocabulary
+        self.assertIn("unicorn", out)          # installed engines are listed
 
-    def test_emu_create_describe_call_roundtrip(self):
-        out = _fn(server.emu)(action="create", options={"engine": "unicorn", "arch": "x86_64"})
-        self.assertTrue(out.startswith("Session created:"), out)
-        sid = out.split("Session created:", 1)[1].split()[0]
-        try:
-            desc = _fn(server.emu)(action="describe", session_id=sid, target="engine", filter="memory")
-            self.assertIn("Capabilities (", desc)
-            self.assertIn("memory_read(", desc)      # real signature, not "name()"
-            # drive the engine through the one tool
-            _fn(server.emu)(action="call", session_id=sid, method="memory_map",
-                            args=["0x1000", 4096], target="engine")
-            _fn(server.emu)(action="call", session_id=sid, method="memory_write",
-                            args=["0x1000", {"hex": "9090"}], target="engine")
-            r = _fn(server.emu)(action="call", session_id=sid, method="memory_read",
-                                args=["0x1000", 2], target="engine")
-            self.assertIn("9090", r.lower())
-        finally:
-            _fn(server.emu)(action="close", session_id=sid)
-
-    def test_emu_unknown_action(self):
-        self.assertIn("unknown action", _fn(server.emu)(action="frobnicate"))
-
-    def test_emu_code_disabled_by_default(self):
-        # Code execution is gated; with it off, emu(action="code") refuses clearly.
-        saved = server.ENABLE_EVAL
-        server.ENABLE_EVAL = False
-        try:
-            out = _fn(server.emu)(action="code", code="1+1")
-            self.assertIn("disabled", out.lower())
-            self.assertIn("EMU_ENABLE_EVAL", out)
-        finally:
-            server.ENABLE_EVAL = saved
-
-    def test_emu_code_persistent_harness(self):
-        # The headline property: helpers defined in one code call persist and are
+    def test_build_and_reuse_persistent_helper(self):
+        # The headline property: a helper defined in one call persists and is
         # reusable in the next -- the model builds its own tooling.
-        saved = server.ENABLE_EVAL
-        server.ENABLE_EVAL = True
-        server._HARNESS_NS.clear()   # isolate from any prior state
+        sid = self._create(engine="unicorn", arch="x86_64")
         try:
-            out = _fn(server.emu)(action="create", options={"engine": "unicorn", "arch": "x86_64"})
-            sid = out.split("Session created:", 1)[1].split()[0]
-            try:
-                # define a helper + use S (named strings), end on an expression
-                r1 = _fn(server.emu)(action="code", session_id=sid, strings={"x": "deadbeef"}, code=(
-                    "e = use(session_id)\n"
-                    "e.memory_map(0x1000, 0x1000, 7)\n"
-                    "def poke(a, h):\n"
-                    "    e.memory_write(a, bytes.fromhex(h))\n"
-                    "    return e.memory_read(a, len(h)//2).hex()\n"
-                    "poke(0x1000, S['x'])"
-                ))
-                self.assertIn("deadbeef", r1)
-                # NEXT call: reuse the persisted helper without redefining it
-                r2 = _fn(server.emu)(action="code", session_id=sid, code="poke(0x1004, 'cafe')")
-                self.assertIn("cafe", r2)
-                # passing code with no action implies code mode
-                r3 = _fn(server.emu)(session_id=sid, code="caps(session_id)")
-                self.assertIn("shellcode", r3)
-            finally:
-                _fn(server.emu)(action="close", session_id=sid)
+            r1 = _fn(server.emu)(session_id=sid, strings={"x": "deadbeef"}, code=(
+                "engine.memory_map(0x1000, 0x1000, 7)\n"
+                "def poke(a, h):\n"
+                "    engine.memory_write(a, bytes.fromhex(h))\n"
+                "    return engine.memory_read(a, len(h)//2).hex()\n"
+                "poke(0x1000, S['x'])"
+            ))
+            self.assertIn("deadbeef", r1)
+            # NEXT call: reuse the persisted helper without redefining it
+            r2 = _fn(server.emu)(session_id=sid, code="poke(0x1004, 'cafe')")
+            self.assertIn("cafe", r2)
+            # discovery is in-language
+            self.assertIn("shellcode", _fn(server.emu)(session_id=sid, code="caps(session_id)"))
+            self.assertIn("poke", _fn(server.emu)(code="kept()"))
         finally:
-            server.ENABLE_EVAL = saved
-            server._HARNESS_NS.clear()
+            _fn(server.emu)(session_id=sid, code=f"close({sid!r})")
+
+    def test_definitions_persist_across_restart(self):
+        # A definition is written to HARNESS_DIR and reloaded into a fresh
+        # namespace -- it survives a server restart.
+        _fn(server.emu)(code="def answer():\n    return 42")
+        self.assertIn("answer", _fn(server.emu)(code="kept()"))
+        server._HARNESS_NS.clear()                      # simulate a restart
+        self.assertIn("42", _fn(server.emu)(code="answer()"))
+        _fn(server.emu)(code="forget('answer')")        # clean up
+        self.assertNotIn("answer", _fn(server.emu)(code="kept()"))
+
+    def test_code_disabled_refuses_clearly(self):
+        saved = server.CODE_ENABLED
+        server.CODE_ENABLED = False
+        try:
+            out = _fn(server.emu)(code="1+1")
+            self.assertIn("disabled", out.lower())
+            self.assertIn("EMU_DISABLE_CODE", out)
+        finally:
+            server.CODE_ENABLED = saved
 
 
 if __name__ == "__main__":

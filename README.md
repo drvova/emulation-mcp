@@ -338,49 +338,46 @@ any engine that can trace, so it works on Unicorn too. Memory is reset between
 runs on both engines (Unicorn snapshots now capture mapped memory, not just
 registers).
 
-### Tool surface: one universal tool
+### Tool surface: one code tool
 
 A fixed catalog of ~70 typed verbs is the wrong interface — engines, archs and
 installs each support a different subset, and models differ in which tools they
 have and how well they use them, so privileging any hand-picked set biases the
-system. By **default the server advertises exactly one tool, `emu`**, and the
-model builds whatever working set it needs on top of it:
+system. By **default the server advertises exactly one tool, `emu`**, which runs
+Python in a **persistent namespace**. The model writes code against a live API
+and builds its own tooling, instead of being handed verbs:
 
 ```
-emu(action="describe")                       # installed engines + how to start
-emu(action="create", options={"engine": "unicorn", "arch": "x86_64"})   # -> session_id
-emu(action="describe", session_id=sid)        # that engine's LIVE capabilities + method signatures
-emu(action="call", session_id=sid, method="memory_write",
-    args=["0x1000", {"hex": "9090"}], target="engine")
-emu(action="code", session_id=sid, code="def poke(a,h): use(session_id).memory_write(a,bytes.fromhex(h))")
-emu(action="sessions") | emu(action="close", session_id=sid)
+emu(code="")                                  # the manual + installed engines
+emu(code="create('unicorn','x86_64')")         # -> session id (binds `engine`/`native`)
+emu(code="describe(sid)")                       # that engine's LIVE capabilities + signatures
+emu(session_id=sid, code="engine.memory_write(0x1000, bytes.fromhex('9090'))")
+emu(session_id=sid, code="def poke(a,h): engine.memory_write(a,bytes.fromhex(h))")  # persists
+emu(session_id=sid, code="poke(0x1004,'cafe')")   # reuse it — next call, and after a restart
 ```
 
-- `describe` reports a session's **live capabilities** and every method's
-  **signature** + one-line doc (from `inspect`, or the docstring for native
-  methods), for the underlying emulator object (`target="native"`: icicle VM,
-  unicorn `Uc`, qiling `Ql`, angr `SimState`, sogen `Emulator`) or the wrapper
-  (`target="engine"`). It's how the model learns what an engine/arch supports.
-- `call` invokes any of those methods (JSON args; `"0x1000"` → int,
-  `{"hex": ".."}`/`{"bytes": [..]}` → bytes; private members blocked). This
-  reaches the **full** engine API (run/step, memory, registers, hooks,
-  snapshots, symbolization, CFG, fuzzing, symbolic execution) with no dedicated
-  tool per capability.
-- `code` runs Python in a **persistent namespace** — the "build your own harness"
-  mode. Functions/variables you define survive across calls, so you accrete your
-  own helpers instead of re-deriving them. The namespace provides
-  `use(session_id)->engine` (binds `engine`/`native`), `caps(session_id)`,
-  `describe(obj)`, `sessions`, `S` (named `strings` you pass), `helpers()`, and
-  the framework modules; end on an expression to return it, or assign `result`.
-  It's arbitrary in-process code, so **off by default** — start the server with
-  `EMU_ENABLE_EVAL=1` (sandboxed) to allow it. It's also how you pass Python
-  callables to callback-based APIs like hooks/MMIO.
+The namespace provides `engines()`, `create(engine, arch, **opts)`, `use(sid)`,
+`describe(sid|obj)` (live capabilities + method signatures), `caps`, `close`,
+`sessions`, `S` (named `strings` you pass, to avoid escaping), `kept()`/`forget()`,
+`man()`, and the bound `engine`/`native` — drive the full engine API off those
+(run/step, memory, registers, hooks, snapshots, symbolization, CFG, fuzzing,
+symbolic execution). End a snippet on an expression to return it, or assign
+`result`.
+
+Functions/variables you define **persist**: reusable on the next call, and —
+because each definition is written to `HARNESS_DIR` (default
+`~/.emulation-mcp/harness`, one file per definition) — reloaded after a restart.
+So the model accretes a harness suited to the task and to how it works.
+
+Code runs with the server's authority, so **run the server sandboxed** (a
+container/VM). It is **on by default**; `EMU_DISABLE_CODE=1` turns it off (then
+set `EMU_EXPOSE_TYPED_TOOLS=1` to use the explicit typed verbs instead).
 
 Set **`EMU_EXPOSE_TYPED_TOOLS=1`** to additionally advertise the full catalog of
 explicit `emu_*` verbs (for clients/models that prefer discoverable, typed
-verbs). The flag only changes what is **advertised**: every `emu_*` function
-exists regardless, `emu` dispatches to it, and it stays reachable through
-`emu(action="call", …)`, so no capability is lost when the catalog is hidden.
+verbs). Every `emu_*` function exists regardless and is reachable from code
+(e.g. `engine.symbolize(addr)`), so no capability is lost when the catalog is
+hidden.
 
 ## Architecture
 

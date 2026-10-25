@@ -11,37 +11,41 @@ marked. Capability names in parentheses (e.g. `'coverage'`) are the flags a
 session advertises; a tool checks the flag and reports if the engine doesn't
 have it.
 
-## Tool surface: one universal tool
+## Tool surface: one code tool
 
 A fixed catalog of typed tools is not the interface. Engines, archs and installs
 each support a different subset of capabilities, and models differ in which
 tools they have and how well they use them, so privileging any hand-picked set
 biases the system. By **default the server advertises exactly one tool, `emu`**,
-and a model builds whatever working set it needs on top of it:
+which runs Python in a **persistent namespace** — the model writes code against a
+live API and builds its own tooling, rather than being handed verbs:
 
 ```
-emu(action="describe")                      # installed engines + how to start
-emu(action="create", options={...})         # -> session_id (engine+arch, or binary+rootfs)
-emu(action="describe", session_id=sid)       # that engine's LIVE capabilities + signatures
-emu(action="call", session_id=sid, method=..., args=[...], target="engine"|"native")
-emu(action="code", session_id=sid, code="...")   # build + reuse your own helpers (persistent)
-emu(action="sessions") | emu(action="close", session_id=sid)
+emu(code="")                                 # the manual + installed engines
+emu(code="create('unicorn','x86_64')")        # -> session id (binds `engine`/`native`)
+emu(code="describe(sid)")                      # that engine's LIVE capabilities + signatures
+emu(session_id=sid, code="engine.memory_write(0x1000, bytes.fromhex('9090'))")
+emu(session_id=sid, code="def poke(a,h): engine.memory_write(a,bytes.fromhex(h))")  # persists
+emu(session_id=sid, code="poke(0x1004,'cafe')")   # reuse it — next call, and after a restart
 ```
 
-- **`emu(action="describe", session_id=…)`** reports the session's **live
-  capabilities** and every method's **signature** (from `inspect`, or the
-  docstring for native methods), so the model knows exactly what this
-  engine/arch supports and how to call it.
-- **`emu(action="call", …)`** then invokes any of those methods (JSON args, hex/bytes
-  coercions) — reaching the full engine API (hooks, snapshots, symbolization,
-  CFG, fuzzing, …) with no dedicated tool per capability.
+The namespace provides `engines()`, `create(engine, arch, **opts)`, `use(sid)`,
+`describe(sid|obj)` (live capabilities + method signatures), `caps`, `close`,
+`sessions`, `S` (named `strings` you pass), `kept()`/`forget()`, `man()`, and the
+bound `engine`/`native`. Functions/variables you define **persist**: reusable on
+the next call, and — because each definition is written to `HARNESS_DIR` (default
+`~/.emulation-mcp/harness`) — reloaded after a restart. Drive the full engine API
+(hooks, snapshots, symbolization, CFG, fuzzing, …) straight off `engine`/`native`.
+
+Code runs with the server's authority, so **run the server sandboxed** (a
+container/VM). It is **on by default**; `EMU_DISABLE_CODE=1` turns it off (then
+set `EMU_EXPOSE_TYPED_TOOLS=1` to use the explicit typed verbs instead).
 
 Set **`EMU_EXPOSE_TYPED_TOOLS=1`** to *also* advertise the full catalog of
 explicit `emu_*` verbs documented below (for clients or models that prefer
-discoverable, typed verbs). The flag only changes what is **advertised** — every
-`emu_*` function exists regardless, `emu` dispatches to it, and it stays
-reachable through `emu(action="call", …)`. The rest of this document lists that
-full catalog; each entry maps to a `method` you can invoke via `emu`.
+discoverable, typed verbs). Every `emu_*` function exists regardless and is
+reachable from code (e.g. `engine.symbolize(addr)`); the rest of this document
+lists that catalog.
 
 ## Engines
 
@@ -222,34 +226,33 @@ Sogen drives the shared tools: `emu_create_session` (`engine="sogen"`,
 - `emu_compare_engines` — Unicorn vs Icicle differential on the same shellcode
 
 ### The one tool (always advertised)
-`emu` (see **Tool surface** above) is the primary interface: it reaches the full
-engine API without a dedicated tool per capability, and is all a model needs
-even when the typed catalog is not advertised. Its actions:
-- `describe` — with no session, lists installed engines + how to start; with a
-  session, reports its **live capabilities** plus every method's **signature**
-  and one-line doc. Start here to learn what an engine/arch supports.
-- `create` — open a session (`options={"engine": …, "arch": …}` or
-  `{"engine": "sogen", "ostype": …, "binary_path": …}`).
-- `call` — invoke any method by name (JSON args with hex/bytes coercions;
-  private members blocked; `target="engine"|"native"`). Drives hooks, snapshots,
-  symbolization, CFG, fuzzing, … on any engine.
-- `sessions` / `close` — list or close sessions.
-- `code` — run Python in a **persistent namespace**: functions and variables you
-  define survive across calls, so you accrete your own harness (helpers tuned to
-  the task and to how you work) instead of re-deriving it each time. The
-  namespace provides `use(session_id)->engine` (binds `engine`/`native`),
-  `caps(session_id)`, `describe(obj)`, `sessions`, `S` (named `strings` you pass,
-  to avoid escaping), `helpers()`, and the framework modules; end on an
-  expression to return its value, or assign `result`. This executes arbitrary
-  Python in the server process, so it is **off by default** — enable it only in a
-  trusted, sandboxed setup (a container/VM) with `EMU_ENABLE_EVAL=1`. It is also
-  the way to drive callback-based APIs (hooks, MMIO) that can't cross the JSON
-  boundary. (State lives for the server process; it is not persisted to disk
-  across restarts.) `emu_eval` shares this same namespace.
+`emu(code, session_id, strings)` (see **Tool surface** above) is the whole
+interface: it runs Python in a persistent namespace, and the model builds its own
+tooling there. Call with empty `code` for the manual. The namespace provides:
+- `engines()` — installed engines + live capabilities.
+- `create(engine, arch, **opts)` — open a session (opts: `binary_path`, `rootfs`,
+  `ostype`, `args`, `engine_options`, `label`); returns the id and binds
+  `engine`/`native`.
+- `use(sid)` — bind `engine`/`native` to an existing session; `close(sid)`;
+  `sessions` — the manager.
+- `describe(sid | obj)` — a session's **live capabilities** plus every method's
+  **signature** and one-line doc, or any object's public members. Start here.
+- `caps(sid|engine)`, `S` (named `strings` you pass, to avoid escaping),
+  `kept()` / `forget(name)`, `man()`, and the framework modules.
+- the bound `engine` / `native` — drive the full engine API (run, memory,
+  registers, hooks, snapshots, symbolization, CFG, fuzzing, symbolic exec) in code.
+
+Functions/variables you define **persist**: reusable on the next call, and, since
+each definition is written to `HARNESS_DIR` (default `~/.emulation-mcp/harness`,
+one file per definition), reloaded after a restart — you accrete a harness
+instead of re-deriving it. End a snippet on an expression to return it, or assign
+`result`. Code runs with the server's authority, so **run the server sandboxed**;
+it is **on by default**, and `EMU_DISABLE_CODE=1` turns it off. `emu_eval` shares
+this same namespace.
 
 The typed `emu_*` verbs listed throughout this document are advertised only when
-`EMU_EXPOSE_TYPED_TOOLS=1`; otherwise invoke them (or the engine methods behind
-them) through `emu(action="call", …)`.
+`EMU_EXPOSE_TYPED_TOOLS=1`; otherwise invoke the engine methods behind them from
+code (e.g. `engine.symbolize(addr)`).
 
 ## See also
 
