@@ -11,6 +11,7 @@ Usage:
 import sys
 import os
 import re
+import inspect
 import subprocess
 import json
 import threading
@@ -38,16 +39,50 @@ mcp = FastMCP(
         "             serves as an independent cross-check of Unicorn (see emu_compare_engines).\n"
         "- 'angr':    Symbolic execution. Make registers/memory symbolic and solve for the\n"
         "             inputs that drive execution to a target address (emu_explore/emu_solve).\n\n"
-        "Typical workflow:\n"
-        "1. Create a session with emu_create_session (pick an engine + arch)\n"
-        "2. For CPU engines: map memory, write code, run\n"
-        "3. For Qiling: point at binary + rootfs, hook syscalls/APIs, run\n"
-        "4. For angr: write code, make inputs symbolic, emu_explore to a target, emu_solve\n"
-        "5. Inspect registers, memory, trace; use snapshots to save/restore state"
+        "One tool is advertised: `emu`. It runs Python in a persistent namespace, and\n"
+        "you build your own tooling there -- no fixed catalog of verbs, because\n"
+        "engines/archs/models differ in what they support and suit.\n"
+        "  emu(code=\"\")                                -> the manual + installed engines\n"
+        "  emu(code=\"create('unicorn','x86_64')\")       -> a session id (binds `engine`)\n"
+        "  emu(code=\"describe(sid)\")                    -> that engine's capabilities + signatures\n"
+        "  emu(session_id=sid, code=\"engine.memory_write(0x1000, bytes.fromhex('9090'))\")\n"
+        "Functions you define PERSIST (reusable next call, and saved to disk across restarts),\n"
+        "so you accrete a harness. Drive the FULL engine API off `engine`/`native` (run/step,\n"
+        "memory, registers, hooks, snapshots, disassembly, symbolization, CFG, fuzzing,\n"
+        "symbolic exec). Code runs with the server's authority -- run the server sandboxed\n"
+        "(a container/VM)."
     ),
 )
 
 sessions = SessionManager()
+
+# ---------------------------------------------------------------------------
+# Tool surface: ONE tool, `emu`. It is the interface, not a feature on top of one.
+# ---------------------------------------------------------------------------
+# A catalog of typed tools is the wrong interface: every backend/arch/install
+# supports a different subset, and models differ in which tools they have and how
+# well they wield them, so privileging any hand-picked set biases the system.
+# `emu` is the whole interface -- it runs code, and the model builds its own
+# tooling on the live API. The other emu_* functions in this module are NOT
+# tools; they are plain functions that `emu`'s namespace and tests call. Only
+# `emu` is registered with MCP.
+_mcp_tool = mcp.tool  # the real FastMCP decorator factory
+
+
+def _gated_tool(*dargs, **dkwargs):
+    """Intercept ``@mcp.tool()`` so `emu` is the only registered tool.
+
+    Every other @mcp.tool()-decorated function stays defined on the module (the
+    harness and tests call them) but is not advertised over MCP.
+    """
+    def deco(fn):
+        if getattr(fn, "__name__", "") == "emu":
+            return _mcp_tool(*dargs, **dkwargs)(fn)
+        return fn
+    return deco
+
+
+mcp.tool = _gated_tool  # every @mcp.tool() below routes through the gate
 
 # ---------------------------------------------------------------------------
 # Security & resource limits
@@ -92,11 +127,17 @@ def _validate_binary_path(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reflective access helpers (emu_call / emu_describe / emu_eval)
+# Reflective access helpers (used by the `emu` code tool)
 # ---------------------------------------------------------------------------
 
-# EM-8: Opt-in gate for the arbitrary-code eval tool (off by default).
-ENABLE_EVAL = os.getenv("EMU_ENABLE_EVAL", "").lower() in ("1", "true", "yes", "on")
+# The `emu` tool runs code with the server process's authority. That is the
+# design -- it is how the model does anything -- so the server must be run
+# sandboxed (a container or VM). There is no enable/disable knob: running code
+# is what the tool is.
+
+# Where the model's self-built harness (the definitions it keeps) is persisted
+# so it survives server restarts, one file per kept definition.
+HARNESS_DIR = os.path.expanduser(os.getenv("EMU_HARNESS_DIR", "~/.emulation-mcp/harness"))
 
 # Background GDB subprocesses, keyed by session_id: (Popen, dump_file_path).
 _GDB_PROCS = {}
@@ -645,10 +686,11 @@ def emu_create_session(
 ) -> str:
     """Create a new emulation session.
 
-    engine: one of "unicorn", "qiling", "icicle", "angr" (see emu_list_engines).
+    engine: one of "unicorn", "qiling", "icicle", "angr", "sogen" (see emu_list_engines).
       - unicorn / icicle: CPU emulators for shellcode & code snippets.
       - qiling: full binary emulation with OS services.
       - angr: symbolic execution (shellcode mode, or binary mode with binary_path).
+      - sogen: Windows/Linux user-mode emulator loading real system libraries.
     arch: Architecture string - "x86", "x86_64", "arm", "arm_thumb", "arm64", "mips",
       "mips_le", and (icicle/angr) "riscv64", "ppc", "ppc64", etc. Optional for angr in
       binary mode (detected from the binary).
@@ -661,6 +703,12 @@ def emu_create_session(
       args: Command-line arguments for the binary.
     For angr binary mode:
       binary_path: Path to the ELF/PE binary (no rootfs needed).
+    For Sogen:
+      binary_path: PE/ELF to run (optional; omit for an empty emulator).
+      rootfs: the emulation root -- a prepared tree of system DLLs + registry for
+        Windows (e.g. https://sogen.dev/root.zip); Linux defaults to the host '/'.
+      ostype: "windows" or "linux".
+      engine_options: {"backend": "unicorn"|"icicle"} selects the CPU backend.
 
     engine_options: Optional dict of engine-specific constructor options. For
       Icicle these map onto the VM knobs, e.g. {"jit": true} (faster, but only
@@ -698,6 +746,16 @@ def emu_create_session(
             eng = engine_cls(arch=arch, binary_path=binary_path, **opts)
             if enable_trace:
                 eng.enable_tracing()
+        elif engine == "sogen":
+            # Sogen: Windows/Linux user-mode. binary_path optional (empty ->
+            # create_empty); rootfs maps to the emulation root. Backend and
+            # other knobs come through engine_options.
+            if binary_path:
+                _validate_binary_path(binary_path)  # EM-1
+            eng = engine_cls(
+                arch=arch or "x86_64", binary_path=binary_path, rootfs=rootfs,
+                ostype=ostype, args=args or [], enable_trace=enable_trace, **opts,
+            )
         else:
             if not arch:
                 return f"Error: arch is required for the '{engine}' engine."
@@ -2039,6 +2097,37 @@ def emu_list_symbols(session_id: str, filter: str = "", limit: int = 100) -> str
 
 
 @mcp.tool()
+def emu_modules(session_id: str) -> str:
+    """List the modules loaded in the guest (Sogen).
+
+    Shows each loaded module (the executable and its shared objects/DLLs) with
+    its image base, entry point, size and export count — useful to see what the
+    loader brought in and where it landed. Run the program first so the loader
+    has mapped its libraries.
+
+    session_id: Active session ID.
+    """
+    try:
+        engine = sessions.get(session_id)
+        mods = engine.list_modules()
+        if not mods:
+            return "No modules loaded (run the program first)."
+        lines = [f"Modules ({len(mods)}):"]
+        for m in mods:
+            base = m.get("image_base")
+            base_s = f"0x{base:x}" if isinstance(base, int) else str(base)
+            lines.append(f"  {base_s}  {m.get('name','')}  "
+                         f"(exports {m.get('exports', 0)}, size {m.get('size')})")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Modules error: {e}"
+
+
+@mcp.tool()
 def emu_memory_maps(session_id: str) -> str:
     """List the guest's mapped memory regions (Qiling).
 
@@ -3239,14 +3328,19 @@ def emu_compare_engines(
 
 @mcp.tool()
 def emu_describe(session_id: str, target: str = "native", filter: str = "") -> str:
-    """List the methods and attributes reachable on a session via emu_call.
+    """Discover a session's full surface: capabilities + methods (with signatures).
 
-    This exposes the *entire* surface of an engine, not just the curated tools —
-    use it to discover what emu_call can invoke.
+    This is how the model self-serves instead of relying on one dedicated tool
+    per capability: it reports the engine's live capability flags and every
+    callable's signature, so you know exactly what this engine/arch supports and
+    how to call it via emu_call. Signatures come from inspect when possible, else
+    from the first line of the method's docstring (native/compiled methods carry
+    their signature there).
 
     session_id: Active session ID.
     target: "native" for the underlying emulator object (icicle VM, unicorn Uc,
-      qiling Ql, angr SimState), or "engine" for the wrapper (the emu_* methods).
+      qiling Ql, angr SimState, sogen Emulator), or "engine" for the wrapper
+      (the emu_* methods behind every typed tool).
     filter: Optional case-insensitive substring to narrow the names.
     """
     try:
@@ -3261,15 +3355,18 @@ def emu_describe(session_id: str, target: str = "native", filter: str = "") -> s
             try:
                 member = getattr(obj, n)
             except Exception:
-                attrs.append(n)
+                attrs.append(f"  {n}")
                 continue
             if callable(member):
-                doc = (getattr(member, "__doc__", "") or "").strip().splitlines()
-                methods.append(f"  {n}(){'  — ' + doc[0] if doc else ''}")
+                methods.append(f"  {n}{_describe_signature(member)}{_describe_doc(member)}")
             else:
                 attrs.append(f"  {n} = {_format_value(member)}")
+        caps = sorted(getattr(engine, "CAPABILITIES", ()) or ())
         lines = [f"{engine.engine_type} session, target='{target}' "
                  f"({type(obj).__module__}.{type(obj).__name__}):\n"]
+        lines.append(f"Capabilities ({len(caps)}): {', '.join(caps) or '(none advertised)'}")
+        lines.append("Invoke any method below with emu_call(session_id, method, "
+                     f"args=[...], target='{target}').\n")
         lines.append(f"Methods ({len(methods)}):")
         lines.extend(methods)
         lines.append(f"\nAttributes ({len(attrs)}):")
@@ -3279,6 +3376,37 @@ def emu_describe(session_id: str, target: str = "native", filter: str = "") -> s
         return str(e)
     except Exception as e:
         return f"Describe error: {e}"
+
+
+def _describe_signature(member) -> str:
+    """Best-effort call signature for a method: inspect first, else docstring."""
+    try:
+        return str(inspect.signature(member))
+    except (ValueError, TypeError):
+        # Compiled/native methods (nanobind/pybind/builtins) have no inspectable
+        # signature, but conventionally put it on the first docstring line, e.g.
+        # "read_memory(self, arg0: int, arg1: int, /) -> bytes".
+        doc = (getattr(member, "__doc__", "") or "").strip().splitlines()
+        if doc and "(" in doc[0]:
+            sig = doc[0].split("(", 1)[1]
+            return "(" + sig
+        return "(...)"
+
+
+def _describe_doc(member) -> str:
+    """The method's one-line summary, skipping a leading signature line."""
+    doc = (getattr(member, "__doc__", "") or "").strip().splitlines()
+    if not doc:
+        return ""
+    first = doc[0].strip()
+    # If the first line is just the signature, use the next non-empty line.
+    name = getattr(member, "__name__", "")
+    if name and first.startswith(name + "(") and len(doc) > 1:
+        for line in doc[1:]:
+            if line.strip():
+                return "  — " + line.strip()
+        return ""
+    return "  — " + first
 
 
 @mcp.tool()
@@ -3328,57 +3456,283 @@ def emu_call(
 
 @mcp.tool()
 def emu_eval(session_id: str, code: str) -> str:
-    """Run a Python snippet against a session (DISABLED unless opted in).
+    """Run a Python snippet against a session (internal; see the `emu` tool).
 
-    The snippet executes with `engine` (the wrapper), `native` (the underlying
-    emulator object), and `icicle`/`unicorn`/`qiling`/`angr` modules in scope.
-    Assign to `result` or end with an expression to return a value; anything
-    printed is captured.
-
-    This runs arbitrary Python in the server process and is therefore OFF by
-    default. Enable it only in a trusted, local setup by starting the server
-    with the environment variable EMU_ENABLE_EVAL=1.
+    Thin wrapper over the same persistent harness `emu` uses, kept for callers of
+    the legacy name. `emu(code=..., session_id=...)` is the real interface.
 
     session_id: Active session ID.
     code: Python source to execute.
     """
-    if not ENABLE_EVAL:
-        return ("Error: emu_eval is disabled. It runs arbitrary Python in the "
-                "server process. To enable it in a trusted local setup, restart "
-                "the server with EMU_ENABLE_EVAL=1.")
+    return _run_harness(code, session_id=session_id)
+
+
+# ===========================================================================
+# The one universal tool
+# ===========================================================================
+
+def _raw(name: str):
+    """Return the underlying function for an emu_* tool, whether or not it was
+    wrapped by @mcp.tool() (so `emu` can call it the same way in either mode)."""
+    fn = globals().get(name)
+    return getattr(fn, "fn", fn)
+
+
+# --- The persistent harness: the code namespace the model builds its tools in --
+# `emu` runs Python in ONE long-lived namespace. Everything is reached from
+# here: engines(), create(), a session's methods, describe(), etc. are functions
+# in the namespace, not separate tools. Helper functions/variables the model
+# defines persist for the process, and any *definition* (def/class/assignment)
+# is also written to HARNESS_DIR so it reloads on the next start -- the model
+# accretes its own harness, like a living image, instead of being handed a fixed
+# set of verbs. This is in-process arbitrary Python with the server's authority,
+# so run the server sandboxed.
+_HARNESS_NS: dict = {}
+_HARNESS_ERRORS: list[str] = []
+import ast as _ast  # module-level: used by persistence + last-value eval
+
+_PERSISTABLE = (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef,
+                _ast.Assign, _ast.AnnAssign)
+
+
+def _def_names(node) -> list[str]:
+    """Top-level names a persistable node binds (for one-file-per-definition)."""
+    if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, _ast.AnnAssign) and isinstance(node.target, _ast.Name):
+        return [node.target.id]
+    if isinstance(node, _ast.Assign):
+        return [t.id for t in node.targets if isinstance(t, _ast.Name)]
+    return []
+
+
+def _persist_definitions(code: str) -> None:
+    """Write each top-level definition in `code` to its own file under HARNESS_DIR.
+
+    Only definitions persist (not side-effecting statements like an emulation
+    run), so reloading at boot rebuilds the model's tools without replaying work.
+    """
     try:
-        engine = sessions.get(session_id)
-    except KeyError as e:
-        return str(e)
-    import io
-    import contextlib
-    ns = {
-        "engine": engine,
-        "native": _native_object(engine),
-        "result": None,
-    }
-    # Make the engine framework modules available if imported.
-    for mod in ("icicle", "unicorn", "qiling", "angr", "capstone"):
+        tree = _ast.parse(code, "<emu>", "exec")
+    except SyntaxError:
+        return
+    try:
+        os.makedirs(HARNESS_DIR, exist_ok=True)
+    except OSError:
+        return
+    for node in tree.body:
+        if not isinstance(node, _PERSISTABLE):
+            continue
+        for name in _def_names(node):
+            if name.startswith("_"):
+                continue
+            try:
+                src = _ast.unparse(node)
+                with open(os.path.join(HARNESS_DIR, f"{name}.py"), "w") as f:
+                    f.write(src + "\n")
+            except Exception:
+                pass
+
+
+def _load_persisted(ns: dict) -> None:
+    """Re-exec every persisted definition into the namespace (one per file)."""
+    if not os.path.isdir(HARNESS_DIR):
+        return
+    for fname in sorted(os.listdir(HARNESS_DIR)):
+        if not fname.endswith(".py"):
+            continue
+        path = os.path.join(HARNESS_DIR, fname)
+        try:
+            with open(path) as f:
+                exec(compile(f.read(), path, "exec"), ns)  # noqa: S102
+        except Exception as e:  # a bad kept def must not break startup
+            _HARNESS_ERRORS.append(f"{fname}: {type(e).__name__}: {e}")
+
+
+def _harness_ns() -> dict:
+    """Return the persistent harness namespace, seeding it once."""
+    ns = _HARNESS_NS
+    if ns.get("_seeded"):
+        return ns
+    ns["_seeded"] = True
+    ns["sessions"] = sessions
+    for mod in ("engines", "icicle", "unicorn", "qiling", "angr", "capstone", "sogen"):
         try:
             ns[mod] = __import__(mod)
         except Exception:
             pass
+
+    def engines():
+        """Installed engines and their live capabilities (same as emu_list_engines)."""
+        return _raw("emu_list_engines")()
+
+    def create(engine, arch="", **opts):
+        """Create a session and return its id. opts: binary_path, rootfs, ostype,
+        args, engine_options, label (see emu_create_session)."""
+        out = _raw("emu_create_session")(engine=engine, arch=arch, **opts)
+        sid = out.split("Session created:", 1)[1].split()[0] if "Session created:" in out else None
+        if sid:
+            use(sid)
+        return sid or out
+
+    def use(session_id: str):
+        """Bind `engine`/`native` to this session and return the engine."""
+        eng = sessions.get(session_id)
+        ns["engine"] = eng
+        ns["native"] = _native_object(eng)
+        ns["session_id"] = session_id
+        return eng
+
+    def close(session_id: str):
+        """Close a session."""
+        return _raw("emu_close_session")(session_id)
+
+    def caps(x):
+        """Capability flags of a session id or engine object."""
+        eng = x if hasattr(x, "CAPABILITIES") else sessions.get(x)
+        return sorted(eng.CAPABILITIES)
+
+    def describe(obj=None):
+        """Rich description: for a session id, its capabilities + method signatures;
+        for any object, its public members; for None, the harness names you have."""
+        if obj is None:
+            return sorted(k for k in ns if not k.startswith("_"))
+        if isinstance(obj, str):  # treat as a session id
+            return _raw("emu_describe")(obj, target="engine")
+        return [n for n in dir(obj) if not n.startswith("_")]
+
+    def forget(name: str):
+        """Drop a kept definition: remove it from the namespace and HARNESS_DIR."""
+        ns.pop(name, None)
+        try:
+            os.remove(os.path.join(HARNESS_DIR, f"{name}.py"))
+        except OSError:
+            pass
+        return f"forgot {name}"
+
+    def kept():
+        """Names of definitions persisted to HARNESS_DIR (survive restarts)."""
+        if not os.path.isdir(HARNESS_DIR):
+            return []
+        return sorted(f[:-3] for f in os.listdir(HARNESS_DIR) if f.endswith(".py"))
+
+    def man():
+        """The harness manual: what this namespace gives you."""
+        return (
+            "emu is one tool: it runs Python in this persistent namespace, and you build\n"
+            "your own tooling here. Provided:\n"
+            "  engines()                      -> installed engines + capabilities\n"
+            "  create(engine, arch, **opts)   -> session id (binds engine/native)\n"
+            "  use(sid) -> engine             bind engine/native to a session\n"
+            "  describe(sid|obj)              capabilities + method signatures / members\n"
+            "  caps(sid|engine) ; close(sid) ; sessions (the manager)\n"
+            "  engine, native                 the bound session's wrapper / raw object\n"
+            "  S                              dict of named `strings` you passed (avoids escaping)\n"
+            "  kept() ; forget(name)          list / drop persisted definitions\n"
+            "Define functions/vars with def/class/=, and they PERSIST: reusable next call and,\n"
+            "because definitions are written to HARNESS_DIR, after a restart. End a snippet on\n"
+            "an expression to return it (REPL-style) or assign `result`. Drive the full engine\n"
+            "API straight off `engine`/`native` (run, memory R/W, registers, hooks, snapshots,\n"
+            "disassembly, symbolization, CFG, fuzzing, symbolic exec).")
+
+    ns.update(engines=engines, create=create, use=use, close=close, caps=caps,
+              describe=describe, forget=forget, kept=kept, man=man, help=man)
+    _load_persisted(ns)  # rebuild the model's accreted tools from disk
+    return ns
+
+
+def _exec_with_last_value(code: str, ns: dict, buf):
+    """Exec `code` in ns; if it ends in an expression, return that value (REPL-style)."""
+    import contextlib
+    tree = _ast.parse(code, "<emu>", "exec")
+    last_expr = None
+    if tree.body and isinstance(tree.body[-1], _ast.Expr):
+        last_expr = _ast.Expression(tree.body.pop().value)
+    with contextlib.redirect_stdout(buf):
+        if tree.body:
+            exec(compile(tree, "<emu>", "exec"), ns)  # noqa: S102 — the server's one tool runs code
+        if last_expr is not None:
+            return eval(compile(last_expr, "<emu>", "eval"), ns)  # noqa: S307
+    return None
+
+
+def _run_harness(code: str, session_id: str = "", strings: dict | None = None) -> str:
+    """Execute `code` in the persistent harness namespace."""
+    import io
+    ns = _harness_ns()
+    if session_id:
+        try:
+            eng = sessions.get(session_id)
+        except KeyError as e:
+            return str(e)
+        ns["engine"] = eng
+        ns["native"] = _native_object(eng)
+        ns["session_id"] = session_id
+    ns["S"] = dict(strings or {})
+    ns["result"] = None  # fresh each call; stale values should not leak as the result
     buf = io.StringIO()
     try:
-        compiled = compile(code, "<emu_eval>", "exec")
-        with contextlib.redirect_stdout(buf):
-            exec(compiled, ns)  # noqa: S102 — intentional, gated by EMU_ENABLE_EVAL
-        out = buf.getvalue()
-        result = ns.get("result")
-        parts = []
-        if out:
-            parts.append(f"stdout:\n{out.rstrip()}")
-        parts.append(f"result: {_format_value(result)}")
-        return "\n".join(parts)
+        value = _exec_with_last_value(code, ns, buf)
     except Exception as e:
         out = buf.getvalue()
         prefix = f"stdout:\n{out.rstrip()}\n" if out else ""
-        return f"{prefix}eval error: {type(e).__name__}: {e}"
+        return f"{prefix}error: {type(e).__name__}: {e}"
+    # Persist any definitions so the harness survives a restart.
+    _persist_definitions(code)
+    out = buf.getvalue()
+    val = value if value is not None else ns.get("result")
+    parts = []
+    if out:
+        parts.append(f"stdout:\n{out.rstrip()}")
+    parts.append(f"result: {_format_value(val)}")
+    return "\n".join(parts)
+
+
+@mcp.tool()
+def emu(code: str = "", session_id: str = "", strings: dict | None = None) -> str:
+    """The one tool: run Python in a persistent namespace and build your own tooling.
+
+    There is no fixed catalog of verbs (which would assume every engine, arch and
+    model wants the same ones). Instead you write code against a live namespace,
+    and the helper functions you define PERSIST — reusable on the next call and,
+    because definitions are saved to disk, after a restart. You accrete a harness
+    suited to the task and to how you work.
+
+    Call with empty `code` to get the manual (what the namespace provides and how
+    to start). The namespace gives you:
+      - engines()                     -> installed engines + live capabilities
+      - create(engine, arch, **opts)  -> a session id (binds `engine`/`native`);
+                                         opts: binary_path, rootfs, ostype, args,
+                                         engine_options, label
+      - use(sid) -> engine            bind `engine`/`native` to an existing session
+      - describe(sid | obj)           a session's capabilities + method signatures,
+                                      or any object's public members
+      - caps(sid|engine), close(sid), sessions (the manager), kept(), forget(name)
+      - engine, native               the bound session's wrapper / raw emulator object
+      - S                            dict of the `strings` you passed (pass long/literal
+                                     text here instead of escaping it inside `code`)
+    Drive the full engine API straight off `engine`/`native` (run, step, memory
+    read/write/map, registers, hooks, snapshots, disassembly, symbolization, CFG,
+    fuzzing, symbolic execution). End a snippet on an expression to return it, or
+    assign `result`.
+
+    Example:
+      emu(code="create('unicorn','x86_64')")                       # -> sid; binds engine
+      emu(session_id=sid, code="engine.memory_map(0x1000,0x1000,7)\\n"
+                               "def poke(a,h): engine.memory_write(a,bytes.fromhex(h))\\n"
+                               "poke(0x1000, S['x'])", strings={"x":"9090"})
+      emu(session_id=sid, code="poke(0x1004,'cafe')")              # poke persisted — reused
+
+    This executes arbitrary Python with the server's authority -- that is how the
+    tool works -- so run the server sandboxed (a container/VM).
+    """
+    if not code.strip():
+        ns = _harness_ns()
+        manual = ns["man"]()
+        extra = (f"\n\nNote: {len(_HARNESS_ERRORS)} kept definition(s) failed to load: "
+                 + "; ".join(_HARNESS_ERRORS)) if _HARNESS_ERRORS else ""
+        return manual + "\n\n" + _raw("emu_list_engines")() + extra
+    return _run_harness(code, session_id=session_id, strings=strings)
 
 
 # ===========================================================================

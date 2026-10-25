@@ -1,6 +1,6 @@
 # emulation-mcp
 
-MCP server for CPU and binary emulation in reverse engineering workflows. Four
+MCP server for CPU and binary emulation in reverse engineering workflows. Five
 pluggable backends cover everything from raw shellcode to full binaries to
 symbolic execution; each is loaded lazily, so you only install the ones you use.
 
@@ -136,6 +136,42 @@ show which are active).
 - Works on raw shellcode (shellcode mode) or whole binaries (binary mode)
 - Also supports the ordinary concrete workflow (run, step, read state, snapshots)
 
+### Sogen — Windows / Linux user-mode emulation *(new)*
+- Runs real PE (and ELF) binaries by loading the **genuine** system libraries
+  (ntdll/kernel32/user32 on Windows, the ELF loader + libc on Linux) and
+  emulating at the CPU + syscall level — so PE loading, SEH, the PEB/TEB,
+  threading, the registry and the filesystem behave as the real loader would
+- **Selectable CPU backend** — `engine_options={"backend": "unicorn"}` (default)
+  or `{"backend": "icicle"}`; x86-64 and ARM64 guests. Both backends work out of
+  the box — the engine points the icicle backend at the Ghidra SLEIGH specs that
+  ship inside the sogen package
+- Create a session with `engine="sogen"`, `ostype="windows"|"linux"`, a
+  `binary_path` (or omit it for an empty emulator) and `rootfs` = the emulation
+  root. Then `emu_run` / `emu_step`, read/write/map/protect/unmap memory,
+  read/write registers, and `emu_snapshot_*` (snapshots use Sogen's
+  `serialize_state`/`deserialize_state`)
+- **Real OS emulation** — loads the genuine loader + libraries and emulates
+  syscalls; `emu_syscall_stats` reports the syscall histogram from a run,
+  `emu_modules` lists the modules the loader brought in (exe + shared objects)
+- **Symbolization** — `emu_load_symbols` / `emu_symbolize` / `emu_lookup_symbol`
+  / `emu_list_symbols` resolve addresses ↔ names from loaded modules' export
+  tables (e.g. a libc address → `malloc+0x4`)
+- **Disassembly** — `emu_disassemble` disassembles guest code with capstone
+  (x86-64 / ARM64)
+- **API / symbol interception** — `engine.hook_api("kernel32!Sleep", fn)` on
+  Windows or `engine.hook_api("libc!strcmp", fn)` on Linux (via `emu_eval`)
+- **Callback hooks** — per-instruction (`add_code_hook`), basic-block
+  (`add_block_hook`), memory read/write/violation over a range (`add_mem_hook`),
+  interrupt (`add_intr_hook`) and instruction-type (`hook_insn`) callbacks
+- **I/O capture** — `emu_capture_output` tees the guest's stdout/stderr
+- **Register introspection** — `emu_list_registers` dumps the full register file
+- Capabilities are feature-detected at session creation, so a session advertises
+  only what the installed Sogen build actually exposes
+- Install with the helper `./scripts/build-sogen.sh /path/to/venv/bin/python` —
+  it installs the prebuilt wheel on CPython 3.9/3.10 and otherwise builds from
+  source with the SDL3/tools CMake options off. Windows needs an emulation root
+  (`https://sogen.dev/root.zip`); Linux can use the host `/`. Sogen is GPL-2.0-only
+
 ### Shared features
 - Session management with unique IDs, auto-cleanup after idle timeout
 - Memory search across the emulated address space
@@ -144,48 +180,51 @@ show which are active).
 
 ## Engine capabilities at a glance
 
-| Capability          | unicorn | qiling | icicle | angr |
-|---------------------|:-------:|:------:|:------:|:----:|
-| shellcode           |   ✓     |        |   ✓    |  ✓   |
-| binary loading      |         |   ✓    |        |  ✓   |
-| OS emulation        |         |   ✓    |        |      |
-| syscall / API hooks |         |   ✓    |        |      |
-| address hooks       |   ✓     |   ✓    |   ✓    |  ✓   |
-| instruction trace   |   ✓     |        |   ✓    |  ✓   |
-| memory trace        |   ✓     |        |        |      |
-| snapshots           |   ✓     |   ✓    |   ✓    |  ✓   |
-| symbolic execution  |         |        |        |  ✓   |
-| constraints / solver|         |        |        |  ✓   |
-| data-flow analyses  |         |        |        |  ✓   |
-| CFG / functions     |         |        |        |  ✓   |
-| function calls      |         |        |        |  ✓   |
-| decompiler          |         |        |        |  ✓   |
-| function hooks      |         |        |        |  ✓   |
-| event inspection    |         |        |        |  ✓   |
-| memory management   |         |        |   ✓    |      |
-| breakpoints         |         |        |   ✓    |      |
-| register introspection |      |   ✓    |   ✓    |      |
-| native disassembly  |         |   ✓    |  ✓ †   |      |
-| callback hooks      |         |   ✓    |  ✓ †   |      |
-| memory hooks        |         |   ✓    |  ✓ †   |      |
-| p-code IL           |         |        |  ✓ †   |      |
-| MMIO regions        |         |        |  ✓ †   |      |
-| compare logging     |         |        |  ✓ †   |      |
-| symbolization       |         |        |  ✓ †   |      |
-| filesystem mapping  |         |   ✓    |        |      |
-| stdin / stdout I/O  |         |   ✓    |        |      |
-| memory-map listing  |         |   ✓    |        |      |
-| syscall statistics  |         |   ✓    |        |      |
-| instruction hooks   |         |   ✓    |        |      |
-| multithreading      |         |   ✓    |        |      |
-| reverse execution   |         |        |  ✓ †   |      |
-| call stack          |         |        |  ✓ †   |      |
-| wide registers      |         |        |  ✓ †   |      |
-| Linux OS emulation  |         |   ✓    |  ✓ †   |      |
-| block coverage      |         |        |  ✓ †   |      |
-| GDB remote stub     |         |        |  ✓ †   |      |
+| Capability          | unicorn | qiling | icicle | angr | sogen |
+|---------------------|:-------:|:------:|:------:|:----:|:-----:|
+| shellcode           |   ✓     |        |   ✓    |  ✓   |       |
+| binary loading      |         |   ✓    |        |  ✓   |  ✓    |
+| OS emulation        |         |   ✓    |        |      |  ✓    |
+| syscall / API hooks |         |   ✓    |        |      |  ✓    |
+| address hooks       |   ✓     |   ✓    |   ✓    |  ✓   |  ✓    |
+| instruction trace   |   ✓     |        |   ✓    |  ✓   |       |
+| memory trace        |   ✓     |        |        |      |       |
+| snapshots           |   ✓     |   ✓    |   ✓    |  ✓   |  ✓    |
+| symbolic execution  |         |        |        |  ✓   |       |
+| constraints / solver|         |        |        |  ✓   |       |
+| data-flow analyses  |         |        |        |  ✓   |       |
+| CFG / functions     |         |        |        |  ✓   |       |
+| function calls      |         |        |        |  ✓   |       |
+| decompiler          |         |        |        |  ✓   |       |
+| function hooks      |         |        |        |  ✓   |       |
+| event inspection    |         |        |        |  ✓   |       |
+| memory management   |         |        |   ✓    |      |  ✓    |
+| breakpoints         |         |        |   ✓    |      |       |
+| register introspection |      |   ✓    |   ✓    |      |  ✓    |
+| native disassembly  |         |   ✓    |  ✓ †   |      |  ✓ ‡  |
+| callback hooks      |         |   ✓    |  ✓ †   |      |  ✓    |
+| memory hooks        |         |   ✓    |  ✓ †   |      |  ✓    |
+| p-code IL           |         |        |  ✓ †   |      |       |
+| MMIO regions        |         |        |  ✓ †   |      |       |
+| compare logging     |         |        |  ✓ †   |      |       |
+| symbolization       |         |        |  ✓ †   |      |  ✓ ‡  |
+| filesystem mapping  |         |   ✓    |        |      |       |
+| stdin / stdout I/O  |         |   ✓    |        |      |  ✓ §  |
+| memory-map listing  |         |   ✓    |        |      |  ✓ ‡  |
+| syscall statistics  |         |   ✓    |        |      |  ✓    |
+| instruction hooks   |         |   ✓    |        |      |  ✓    |
+| multithreading      |         |   ✓    |        |      |       |
+| reverse execution   |         |        |  ✓ †   |      |       |
+| call stack          |         |        |  ✓ †   |      |       |
+| wide registers      |         |        |  ✓ †   |      |       |
+| Linux OS emulation  |         |   ✓    |  ✓ †   |      |  ✓    |
+| block coverage      |         |        |  ✓ †   |      |       |
+| GDB remote stub     |         |        |  ✓ †   |      |       |
 
 † Icicle feature available with the extended binding (`icicle_ext/`); see below.
+‡ Sogen: disassembly is via capstone; symbolization and memory-map listing come
+from loaded modules' export tables / image bases (run the program first).
+§ Sogen I/O is stdout/stderr capture; feeding stdin is not exposed by its API.
 
 ### Known boundaries
 
@@ -201,6 +240,14 @@ framework:
   `emu_call`/`emu_eval` to drive it if you have one attached.
 - **Icicle JIT internals and the native AFL trace format** have no useful Python
   mapping (the server ships its own `emu_fuzz` loop); see `icicle_ext/README.md`.
+- **Sogen** emulates Windows and Linux user mode. Windows targets need a prepared
+  emulation root (system DLLs + registry, e.g. `https://sogen.dev/root.zip`);
+  Linux can use the host `/`. A few things are bounded by Sogen's Python API, not
+  by this wrapper: feeding **stdin** isn't exposed (stdout/stderr capture is), and
+  it offers no full memory-region enumeration — so `emu_memory_maps` /
+  `emu_memory_search` cover the loaded-module regions, and a byte-pattern search of
+  anonymous allocations/stack means reading a known range yourself. Symbolization
+  resolves exported/dynamic symbols from loaded modules.
 
 Anything not yet a first-class tool is still reachable through the reflective
 tools (`emu_describe` / `emu_call` / `emu_eval`, below).
@@ -291,26 +338,41 @@ any engine that can trace, so it works on Unicorn too. Memory is reset between
 runs on both engines (Unicorn snapshots now capture mapped memory, not just
 registers).
 
-### Reaching the whole engine surface
+### Tool surface: one code tool
 
-The curated tools cover the common workflow. For anything they don't, three
-reflective tools expose the *entire* engine API without a dedicated tool per
-call:
+The interface is **one tool, `emu`** — there is no catalog of verbs and no flag
+to turn one on. A fixed catalog is the wrong interface: engines, archs and
+installs each support a different subset, and models differ in which tools they
+have and how well they use them, so privileging any hand-picked set biases the
+system. `emu` runs Python in a **persistent namespace**; the model writes code
+against a live API and builds its own tooling:
 
-- `emu_describe` — list every method/attribute reachable on a session, for the
-  underlying emulator object (`target="native"`: icicle VM, unicorn `Uc`,
-  qiling `Ql`, angr `SimState`) or the wrapper (`target="engine"`).
-- `emu_call` — invoke any of those methods (or read any attribute) by name.
-  Arguments are JSON with convenience coercions: `"0x1000"` → int,
-  `{"hex": "deadbeef"}` or `{"bytes": [...]}` → bytes. Private members are
-  blocked.
-- `emu_eval` — run a Python snippet against the session (`engine` and `native`
-  in scope). This executes arbitrary Python in the server process, so it is
-  **off by default**; enable it only in a trusted local setup by starting the
-  server with `EMU_ENABLE_EVAL=1`.
+```
+emu(code="")                                  # the manual + installed engines
+emu(code="create('unicorn','x86_64')")         # -> session id (binds `engine`/`native`)
+emu(code="describe(sid)")                       # that engine's LIVE capabilities + signatures
+emu(session_id=sid, code="engine.memory_write(0x1000, bytes.fromhex('9090'))")
+emu(session_id=sid, code="def poke(a,h): engine.memory_write(a,bytes.fromhex(h))")  # persists
+emu(session_id=sid, code="poke(0x1004,'cafe')")   # reuse it — next call, and after a restart
+```
 
-Together these mean a capability that isn't yet a first-class tool is still
-reachable — call it directly, or script it with `emu_eval`.
+The namespace provides `engines()`, `create(engine, arch, **opts)`, `use(sid)`,
+`describe(sid|obj)` (live capabilities + method signatures), `caps`, `close`,
+`sessions`, `S` (named `strings` you pass, to avoid escaping), `kept()`/`forget()`,
+`man()`, and the bound `engine`/`native` — drive the full engine API off those
+(run/step, memory, registers, hooks, snapshots, symbolization, CFG, fuzzing,
+symbolic execution). End a snippet on an expression to return it, or assign
+`result`.
+
+Functions/variables you define **persist**: reusable on the next call, and —
+because each definition is written to `HARNESS_DIR` (default
+`~/.emulation-mcp/harness`, one file per definition) — reloaded after a restart.
+So the model accretes a harness suited to the task and to how it works.
+
+Running code is what the tool is — it executes with the server's authority, so
+**run the server sandboxed** (a container/VM). The `emu_*` names in
+`CAPABILITIES.md` are the engine methods you call from `emu` code
+(e.g. `engine.symbolize(addr)`), not separate tools.
 
 ## Architecture
 
