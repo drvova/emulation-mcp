@@ -48,8 +48,11 @@ mcp = FastMCP(
         "                                                     and every method's signature\n"
         "  4. emu(action=\"call\", session_id=sid, method=..., args=[...], target=\"engine\"|\"native\")\n"
         "This reaches the FULL engine API (run/step, memory, registers, hooks, snapshots,\n"
-        "disassembly, symbolization, CFG, fuzzing, symbolic execution). Set\n"
-        "EMU_EXPOSE_TYPED_TOOLS=1 to also advertise the full catalog of explicit emu_* verbs."
+        "disassembly, symbolization, CFG, fuzzing, symbolic execution) one method at a time.\n"
+        "When code execution is enabled (EMU_ENABLE_EVAL=1, sandboxed), emu(action=\"code\")\n"
+        "runs Python in a PERSISTENT namespace -- define helper functions once and reuse them\n"
+        "across calls to build your own harness. Set EMU_EXPOSE_TYPED_TOOLS=1 to also\n"
+        "advertise the full catalog of explicit emu_* verbs."
     ),
 )
 
@@ -3479,43 +3482,10 @@ def emu_eval(session_id: str, code: str) -> str:
     session_id: Active session ID.
     code: Python source to execute.
     """
-    if not ENABLE_EVAL:
-        return ("Error: emu_eval is disabled. It runs arbitrary Python in the "
-                "server process. To enable it in a trusted local setup, restart "
-                "the server with EMU_ENABLE_EVAL=1.")
-    try:
-        engine = sessions.get(session_id)
-    except KeyError as e:
-        return str(e)
-    import io
-    import contextlib
-    ns = {
-        "engine": engine,
-        "native": _native_object(engine),
-        "result": None,
-    }
-    # Make the engine framework modules available if imported.
-    for mod in ("icicle", "unicorn", "qiling", "angr", "capstone"):
-        try:
-            ns[mod] = __import__(mod)
-        except Exception:
-            pass
-    buf = io.StringIO()
-    try:
-        compiled = compile(code, "<emu_eval>", "exec")
-        with contextlib.redirect_stdout(buf):
-            exec(compiled, ns)  # noqa: S102 — intentional, gated by EMU_ENABLE_EVAL
-        out = buf.getvalue()
-        result = ns.get("result")
-        parts = []
-        if out:
-            parts.append(f"stdout:\n{out.rstrip()}")
-        parts.append(f"result: {_format_value(result)}")
-        return "\n".join(parts)
-    except Exception as e:
-        out = buf.getvalue()
-        prefix = f"stdout:\n{out.rstrip()}\n" if out else ""
-        return f"{prefix}eval error: {type(e).__name__}: {e}"
+    # emu_eval shares the single persistent harness namespace used by
+    # emu(action="code"), so definitions made through either are reusable from
+    # the other. Gating (EMU_ENABLE_EVAL) is enforced inside _run_harness.
+    return _run_harness(code, session_id=session_id)
 
 
 # ===========================================================================
@@ -3529,6 +3499,109 @@ def _raw(name: str):
     return getattr(fn, "fn", fn)
 
 
+# --- The persistent harness: a code namespace the model builds its tools in ----
+# emu(action="code", ...) runs Python in ONE long-lived namespace, so helper
+# functions/variables the model defines persist across calls and can be reused
+# and refined -- the model authors its own harness instead of being handed a
+# fixed set of verbs. (This is in-process arbitrary Python, so it is gated by
+# EMU_ENABLE_EVAL, exactly like emu_eval; run the server in a container/VM when
+# you enable it.) State lives for the life of the server process; it is not
+# persisted to disk across restarts.
+_HARNESS_NS: dict = {}
+
+
+def _harness_ns() -> dict:
+    """Return the persistent harness namespace, seeding it once."""
+    ns = _HARNESS_NS
+    if ns.get("_seeded"):
+        return ns
+    ns["_seeded"] = True
+    ns["sessions"] = sessions
+    for mod in ("engines", "icicle", "unicorn", "qiling", "angr", "capstone", "sogen"):
+        try:
+            ns[mod] = __import__(mod)
+        except Exception:
+            pass
+
+    def use(session_id: str):
+        """Bind `engine`/`native` in the harness to this session and return the engine."""
+        eng = sessions.get(session_id)
+        ns["engine"] = eng
+        ns["native"] = _native_object(eng)
+        ns["session_id"] = session_id
+        return eng
+
+    def caps(session_id: str):
+        """Sorted capability flags a session's engine advertises."""
+        return sorted(sessions.get(session_id).CAPABILITIES)
+
+    def describe(obj=None):
+        """Public names on `obj` (dir without underscores); the harness names if obj is None."""
+        if obj is None:
+            return sorted(k for k in ns if not k.startswith("_"))
+        return [n for n in dir(obj) if not n.startswith("_")]
+
+    def helpers():
+        """One-line reminder of what the harness provides."""
+        return ("use(session_id)->engine (binds engine/native); caps(session_id); "
+                "describe(obj); sessions (manager); S (named strings passed in). "
+                "Define functions/vars with def/= — they persist across emu(action=\"code\") calls.")
+
+    ns.update(use=use, caps=caps, describe=describe, helpers=helpers)
+    return ns
+
+
+def _exec_with_last_value(code: str, ns: dict, buf):
+    """Exec `code` in ns; if it ends in an expression, return that value (REPL-style)."""
+    import ast
+    import contextlib
+    tree = ast.parse(code, "<emu>", "exec")
+    last_expr = None
+    if tree.body and isinstance(tree.body[-1], ast.Expr):
+        last_expr = ast.Expression(tree.body.pop().value)
+    with contextlib.redirect_stdout(buf):
+        if tree.body:
+            exec(compile(tree, "<emu>", "exec"), ns)  # noqa: S102 — gated by EMU_ENABLE_EVAL
+        if last_expr is not None:
+            return eval(compile(last_expr, "<emu>", "eval"), ns)  # noqa: S307
+    return None
+
+
+def _run_harness(code: str, session_id: str = "", strings: dict | None = None) -> str:
+    """Execute `code` in the persistent harness namespace (gated by EMU_ENABLE_EVAL)."""
+    if not ENABLE_EVAL:
+        return ("Error: code execution is disabled. emu(action=\"code\") runs arbitrary "
+                "Python in the server process, so enable it only in a trusted, sandboxed "
+                "setup (a container/VM) by restarting the server with EMU_ENABLE_EVAL=1. "
+                "Until then use action=\"describe\"/\"call\" for structured access.")
+    import io
+    ns = _harness_ns()
+    if session_id:
+        try:
+            eng = sessions.get(session_id)
+        except KeyError as e:
+            return str(e)
+        ns["engine"] = eng
+        ns["native"] = _native_object(eng)
+        ns["session_id"] = session_id
+    ns["S"] = dict(strings or {})
+    ns["result"] = None  # fresh each call; stale values should not leak as the result
+    buf = io.StringIO()
+    try:
+        value = _exec_with_last_value(code, ns, buf)
+    except Exception as e:
+        out = buf.getvalue()
+        prefix = f"stdout:\n{out.rstrip()}\n" if out else ""
+        return f"{prefix}error: {type(e).__name__}: {e}"
+    out = buf.getvalue()
+    val = value if value is not None else ns.get("result")
+    parts = []
+    if out:
+        parts.append(f"stdout:\n{out.rstrip()}")
+    parts.append(f"result: {_format_value(val)}")
+    return "\n".join(parts)
+
+
 @mcp.tool()
 def emu(
     action: str = "describe",
@@ -3539,15 +3612,18 @@ def emu(
     target: str = "native",
     filter: str = "",
     code: str = "",
+    strings: dict | None = None,
     options: dict | None = None,
 ) -> str:
     """One universal entry point to CPU/binary emulation — build your own tooling on it.
 
     This is the only tool advertised by default. Rather than a fixed catalog of
     verbs (which assumes every engine/arch/model supports the same things), you
-    discover a session's real surface and drive it. Everything an engine can do
-    — run, step, memory, registers, hooks, snapshots, disassembly, symbolization,
-    CFG, fuzzing, symbolic execution — is reached through `action="call"`.
+    discover a session's real surface and drive it — and, when code execution is
+    enabled, you author and reuse your own helper functions. Everything an engine
+    can do (run, step, memory, registers, hooks, snapshots, disassembly,
+    symbolization, CFG, fuzzing, symbolic execution) is reached through
+    `action="call"` or `action="code"`.
 
     action:
       - "describe" (default): discover. With no session_id, lists installed
@@ -3560,21 +3636,33 @@ def emu(
         Returns a session_id.
       - "call": invoke `method` on the session (args/kwargs are JSON; "0x10" ->
         int, {"hex": ".."}/{"bytes": [..]} -> bytes). `target` is "native" (the
-        underlying emulator object) or "engine" (the wrapper). This is the
-        workhorse — it reaches the full engine API.
+        underlying emulator object) or "engine" (the wrapper). Reaches the full
+        engine API one method at a time.
+      - "code": run Python in a PERSISTENT namespace — the way to build your own
+        tooling. Functions/variables you define survive across calls, so you
+        accrete a harness suited to the task instead of re-deriving it. The
+        namespace provides: use(session_id)->engine (binds `engine`/`native`),
+        caps(session_id), describe(obj), sessions (the manager), S (your
+        `strings`), helpers(), and the framework modules. End with an expression
+        to return its value (REPL-style), or assign `result`. `code` executes
+        arbitrary Python in the server process, so it is OFF unless the server
+        was started with EMU_ENABLE_EVAL=1 (run it sandboxed). Passing `code`
+        with no action implies action="code".
       - "sessions": list active sessions. "close": close `session_id`.
-      - "eval": run Python `code` against the session (off unless the server was
-        started with EMU_ENABLE_EVAL=1); the way to pass Python callables to
-        callback-based APIs (hooks, MMIO).
 
     Typical flow: emu("describe") -> emu("create", options={...}) ->
     emu("describe", session_id=sid) -> emu("call", session_id=sid,
     method="memory_write", args=["0x1000", {"hex": "9090"}], target="engine").
+    Or, with code enabled: emu(action="code", session_id=sid,
+    code="e=use(session_id)\ndef poke(a,b): e.memory_write(a,b)\npoke(0x1000, S['x'])",
+    strings={"x": "\\x90\\x90"}) — and `poke` is available in later calls.
 
     (Set EMU_EXPOSE_TYPED_TOOLS=1 to also advertise the full catalog of explicit
     emu_* verbs; they are otherwise reachable only through this tool.)
     """
     act = (action or "describe").strip().lower()
+    if code and act in ("describe", ""):  # emu(code=...) implies code mode
+        act = "code"
     try:
         if act == "describe":
             if not session_id:
@@ -3584,7 +3672,8 @@ def emu(
                     "Start by creating a session, then describe it to see what it can do:\n"
                     "  emu(action=\"create\", options={\"engine\": \"<name>\", \"arch\": \"<arch>\"})\n"
                     "  emu(action=\"describe\", session_id=\"<id>\")   # capabilities + method signatures\n"
-                    "  emu(action=\"call\", session_id=\"<id>\", method=\"<name>\", args=[...], target=\"engine\"|\"native\")\n\n"
+                    "  emu(action=\"call\", session_id=\"<id>\", method=\"<name>\", args=[...], target=\"engine\"|\"native\")\n"
+                    "  emu(action=\"code\", session_id=\"<id>\", code=\"...\")   # build + reuse your own helpers (if enabled)\n\n"
                     + engines_out
                 )
             return _raw("emu_describe")(session_id, target=target, filter=filter)
@@ -3596,10 +3685,10 @@ def emu(
             return _raw("emu_close_session")(session_id)
         if act == "call":
             return _raw("emu_call")(session_id, method, args=args, kwargs=kwargs, target=target)
-        if act == "eval":
-            return _raw("emu_eval")(session_id, code)
+        if act in ("code", "eval"):
+            return _run_harness(code, session_id=session_id, strings=strings)
         return (f"Error: unknown action '{action}'. Use one of: "
-                "describe, create, call, sessions, close, eval.")
+                "describe, create, call, code, sessions, close.")
     except TypeError as e:
         return f"Error: bad arguments for action '{act}': {e}"
     except Exception as e:

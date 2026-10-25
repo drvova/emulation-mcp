@@ -352,7 +352,8 @@ emu(action="create", options={"engine": "unicorn", "arch": "x86_64"})   # -> ses
 emu(action="describe", session_id=sid)        # that engine's LIVE capabilities + method signatures
 emu(action="call", session_id=sid, method="memory_write",
     args=["0x1000", {"hex": "9090"}], target="engine")
-emu(action="sessions") | emu(action="close", session_id=sid) | emu(action="eval", ...)
+emu(action="code", session_id=sid, code="def poke(a,h): use(session_id).memory_write(a,bytes.fromhex(h))")
+emu(action="sessions") | emu(action="close", session_id=sid)
 ```
 
 - `describe` reports a session's **live capabilities** and every method's
@@ -365,10 +366,15 @@ emu(action="sessions") | emu(action="close", session_id=sid) | emu(action="eval"
   reaches the **full** engine API (run/step, memory, registers, hooks,
   snapshots, symbolization, CFG, fuzzing, symbolic execution) with no dedicated
   tool per capability.
-- `eval` runs a Python snippet against the session (`engine`/`native` in scope);
-  arbitrary code, so **off by default** — start the server with
-  `EMU_ENABLE_EVAL=1` to allow it (the way to pass Python callables to
-  callback-based APIs like hooks/MMIO).
+- `code` runs Python in a **persistent namespace** — the "build your own harness"
+  mode. Functions/variables you define survive across calls, so you accrete your
+  own helpers instead of re-deriving them. The namespace provides
+  `use(session_id)->engine` (binds `engine`/`native`), `caps(session_id)`,
+  `describe(obj)`, `sessions`, `S` (named `strings` you pass), `helpers()`, and
+  the framework modules; end on an expression to return it, or assign `result`.
+  It's arbitrary in-process code, so **off by default** — start the server with
+  `EMU_ENABLE_EVAL=1` (sandboxed) to allow it. It's also how you pass Python
+  callables to callback-based APIs like hooks/MMIO.
 
 Set **`EMU_EXPOSE_TYPED_TOOLS=1`** to additionally advertise the full catalog of
 explicit `emu_*` verbs (for clients/models that prefer discoverable, typed

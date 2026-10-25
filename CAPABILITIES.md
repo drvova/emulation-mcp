@@ -24,7 +24,8 @@ emu(action="describe")                      # installed engines + how to start
 emu(action="create", options={...})         # -> session_id (engine+arch, or binary+rootfs)
 emu(action="describe", session_id=sid)       # that engine's LIVE capabilities + signatures
 emu(action="call", session_id=sid, method=..., args=[...], target="engine"|"native")
-emu(action="sessions") | emu(action="close", session_id=sid) | emu(action="eval", ...)
+emu(action="code", session_id=sid, code="...")   # build + reuse your own helpers (persistent)
+emu(action="sessions") | emu(action="close", session_id=sid)
 ```
 
 - **`emu(action="describe", session_id=…)`** reports the session's **live
@@ -233,10 +234,18 @@ even when the typed catalog is not advertised. Its actions:
   private members blocked; `target="engine"|"native"`). Drives hooks, snapshots,
   symbolization, CFG, fuzzing, … on any engine.
 - `sessions` / `close` — list or close sessions.
-- `eval` — run a Python snippet against the session. This executes arbitrary
-  Python in the server process, so it is **off by default**; enable it only in a
-  trusted local setup with `EMU_ENABLE_EVAL=1`. It is the way to drive the
-  callback-based APIs (hooks, MMIO) that can't cross the JSON tool boundary.
+- `code` — run Python in a **persistent namespace**: functions and variables you
+  define survive across calls, so you accrete your own harness (helpers tuned to
+  the task and to how you work) instead of re-deriving it each time. The
+  namespace provides `use(session_id)->engine` (binds `engine`/`native`),
+  `caps(session_id)`, `describe(obj)`, `sessions`, `S` (named `strings` you pass,
+  to avoid escaping), `helpers()`, and the framework modules; end on an
+  expression to return its value, or assign `result`. This executes arbitrary
+  Python in the server process, so it is **off by default** — enable it only in a
+  trusted, sandboxed setup (a container/VM) with `EMU_ENABLE_EVAL=1`. It is also
+  the way to drive callback-based APIs (hooks, MMIO) that can't cross the JSON
+  boundary. (State lives for the server process; it is not persisted to disk
+  across restarts.) `emu_eval` shares this same namespace.
 
 The typed `emu_*` verbs listed throughout this document are advertised only when
 `EMU_EXPOSE_TYPED_TOOLS=1`; otherwise invoke them (or the engine methods behind

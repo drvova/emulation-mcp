@@ -881,6 +881,49 @@ class TestToolSurface(unittest.TestCase):
     def test_emu_unknown_action(self):
         self.assertIn("unknown action", _fn(server.emu)(action="frobnicate"))
 
+    def test_emu_code_disabled_by_default(self):
+        # Code execution is gated; with it off, emu(action="code") refuses clearly.
+        saved = server.ENABLE_EVAL
+        server.ENABLE_EVAL = False
+        try:
+            out = _fn(server.emu)(action="code", code="1+1")
+            self.assertIn("disabled", out.lower())
+            self.assertIn("EMU_ENABLE_EVAL", out)
+        finally:
+            server.ENABLE_EVAL = saved
+
+    def test_emu_code_persistent_harness(self):
+        # The headline property: helpers defined in one code call persist and are
+        # reusable in the next -- the model builds its own tooling.
+        saved = server.ENABLE_EVAL
+        server.ENABLE_EVAL = True
+        server._HARNESS_NS.clear()   # isolate from any prior state
+        try:
+            out = _fn(server.emu)(action="create", options={"engine": "unicorn", "arch": "x86_64"})
+            sid = out.split("Session created:", 1)[1].split()[0]
+            try:
+                # define a helper + use S (named strings), end on an expression
+                r1 = _fn(server.emu)(action="code", session_id=sid, strings={"x": "deadbeef"}, code=(
+                    "e = use(session_id)\n"
+                    "e.memory_map(0x1000, 0x1000, 7)\n"
+                    "def poke(a, h):\n"
+                    "    e.memory_write(a, bytes.fromhex(h))\n"
+                    "    return e.memory_read(a, len(h)//2).hex()\n"
+                    "poke(0x1000, S['x'])"
+                ))
+                self.assertIn("deadbeef", r1)
+                # NEXT call: reuse the persisted helper without redefining it
+                r2 = _fn(server.emu)(action="code", session_id=sid, code="poke(0x1004, 'cafe')")
+                self.assertIn("cafe", r2)
+                # passing code with no action implies code mode
+                r3 = _fn(server.emu)(session_id=sid, code="caps(session_id)")
+                self.assertIn("shellcode", r3)
+            finally:
+                _fn(server.emu)(action="close", session_id=sid)
+        finally:
+            server.ENABLE_EVAL = saved
+            server._HARNESS_NS.clear()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
