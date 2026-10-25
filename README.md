@@ -142,22 +142,29 @@ show which are active).
   emulating at the CPU + syscall level — so PE loading, SEH, the PEB/TEB,
   threading, the registry and the filesystem behave as the real loader would
 - **Selectable CPU backend** — `engine_options={"backend": "unicorn"}` (default)
-  or `{"backend": "icicle"}`; x86-64 and ARM64 guests. The `icicle` backend also
-  needs Ghidra's SLEIGH specs reachable from the working directory, so `unicorn`
-  is the reliable default
+  or `{"backend": "icicle"}`; x86-64 and ARM64 guests. Both backends work out of
+  the box — the engine points the icicle backend at the Ghidra SLEIGH specs that
+  ship inside the sogen package
 - Create a session with `engine="sogen"`, `ostype="windows"|"linux"`, a
   `binary_path` (or omit it for an empty emulator) and `rootfs` = the emulation
-  root. Then `emu_run` / `emu_step`, read/write memory and registers, and
-  `emu_snapshot_*` (snapshots use Sogen's `serialize_state`/`deserialize_state`)
+  root. Then `emu_run` / `emu_step`, read/write/map/protect/unmap memory,
+  read/write registers, and `emu_snapshot_*` (snapshots use Sogen's
+  `serialize_state`/`deserialize_state`)
+- **Real OS emulation** — loads the genuine loader + libraries and emulates
+  syscalls; `emu_syscall_stats` reports the syscall histogram from a run,
+  `emu_modules` lists the modules the loader brought in (exe + shared objects)
+- **Symbolization** — `emu_load_symbols` / `emu_symbolize` / `emu_lookup_symbol`
+  / `emu_list_symbols` resolve addresses ↔ names from loaded modules' export
+  tables (e.g. a libc address → `malloc+0x4`)
+- **Disassembly** — `emu_disassemble` disassembles guest code with capstone
+  (x86-64 / ARM64)
 - **API / symbol interception** — `engine.hook_api("kernel32!Sleep", fn)` on
   Windows or `engine.hook_api("libc!strcmp", fn)` on Linux (via `emu_eval`)
 - **Callback hooks** — per-instruction (`add_code_hook`), basic-block
-  (`add_block_hook`), memory read/write over a range (`add_mem_hook`),
+  (`add_block_hook`), memory read/write/violation over a range (`add_mem_hook`),
   interrupt (`add_intr_hook`) and instruction-type (`hook_insn`) callbacks
 - **I/O capture** — `emu_capture_output` tees the guest's stdout/stderr
-- **Register introspection** — `emu_list_registers` dumps the full register file;
-  on Linux builds the debugger facade also powers `emu_disassemble` and
-  `emu_breakpoint_add`
+- **Register introspection** — `emu_list_registers` dumps the full register file
 - Capabilities are feature-detected at session creation, so a session advertises
   only what the installed Sogen build actually exposes
 - Install: prebuilt wheels are CPython 3.9/3.10 only; on other interpreters build
@@ -173,48 +180,51 @@ show which are active).
 
 ## Engine capabilities at a glance
 
-| Capability          | unicorn | qiling | icicle | angr |
-|---------------------|:-------:|:------:|:------:|:----:|
-| shellcode           |   ✓     |        |   ✓    |  ✓   |
-| binary loading      |         |   ✓    |        |  ✓   |
-| OS emulation        |         |   ✓    |        |      |
-| syscall / API hooks |         |   ✓    |        |      |
-| address hooks       |   ✓     |   ✓    |   ✓    |  ✓   |
-| instruction trace   |   ✓     |        |   ✓    |  ✓   |
-| memory trace        |   ✓     |        |        |      |
-| snapshots           |   ✓     |   ✓    |   ✓    |  ✓   |
-| symbolic execution  |         |        |        |  ✓   |
-| constraints / solver|         |        |        |  ✓   |
-| data-flow analyses  |         |        |        |  ✓   |
-| CFG / functions     |         |        |        |  ✓   |
-| function calls      |         |        |        |  ✓   |
-| decompiler          |         |        |        |  ✓   |
-| function hooks      |         |        |        |  ✓   |
-| event inspection    |         |        |        |  ✓   |
-| memory management   |         |        |   ✓    |      |
-| breakpoints         |         |        |   ✓    |      |
-| register introspection |      |   ✓    |   ✓    |      |
-| native disassembly  |         |   ✓    |  ✓ †   |      |
-| callback hooks      |         |   ✓    |  ✓ †   |      |
-| memory hooks        |         |   ✓    |  ✓ †   |      |
-| p-code IL           |         |        |  ✓ †   |      |
-| MMIO regions        |         |        |  ✓ †   |      |
-| compare logging     |         |        |  ✓ †   |      |
-| symbolization       |         |        |  ✓ †   |      |
-| filesystem mapping  |         |   ✓    |        |      |
-| stdin / stdout I/O  |         |   ✓    |        |      |
-| memory-map listing  |         |   ✓    |        |      |
-| syscall statistics  |         |   ✓    |        |      |
-| instruction hooks   |         |   ✓    |        |      |
-| multithreading      |         |   ✓    |        |      |
-| reverse execution   |         |        |  ✓ †   |      |
-| call stack          |         |        |  ✓ †   |      |
-| wide registers      |         |        |  ✓ †   |      |
-| Linux OS emulation  |         |   ✓    |  ✓ †   |      |
-| block coverage      |         |        |  ✓ †   |      |
-| GDB remote stub     |         |        |  ✓ †   |      |
+| Capability          | unicorn | qiling | icicle | angr | sogen |
+|---------------------|:-------:|:------:|:------:|:----:|:-----:|
+| shellcode           |   ✓     |        |   ✓    |  ✓   |       |
+| binary loading      |         |   ✓    |        |  ✓   |  ✓    |
+| OS emulation        |         |   ✓    |        |      |  ✓    |
+| syscall / API hooks |         |   ✓    |        |      |  ✓    |
+| address hooks       |   ✓     |   ✓    |   ✓    |  ✓   |  ✓    |
+| instruction trace   |   ✓     |        |   ✓    |  ✓   |       |
+| memory trace        |   ✓     |        |        |      |       |
+| snapshots           |   ✓     |   ✓    |   ✓    |  ✓   |  ✓    |
+| symbolic execution  |         |        |        |  ✓   |       |
+| constraints / solver|         |        |        |  ✓   |       |
+| data-flow analyses  |         |        |        |  ✓   |       |
+| CFG / functions     |         |        |        |  ✓   |       |
+| function calls      |         |        |        |  ✓   |       |
+| decompiler          |         |        |        |  ✓   |       |
+| function hooks      |         |        |        |  ✓   |       |
+| event inspection    |         |        |        |  ✓   |       |
+| memory management   |         |        |   ✓    |      |  ✓    |
+| breakpoints         |         |        |   ✓    |      |       |
+| register introspection |      |   ✓    |   ✓    |      |  ✓    |
+| native disassembly  |         |   ✓    |  ✓ †   |      |  ✓ ‡  |
+| callback hooks      |         |   ✓    |  ✓ †   |      |  ✓    |
+| memory hooks        |         |   ✓    |  ✓ †   |      |  ✓    |
+| p-code IL           |         |        |  ✓ †   |      |       |
+| MMIO regions        |         |        |  ✓ †   |      |       |
+| compare logging     |         |        |  ✓ †   |      |       |
+| symbolization       |         |        |  ✓ †   |      |  ✓ ‡  |
+| filesystem mapping  |         |   ✓    |        |      |       |
+| stdin / stdout I/O  |         |   ✓    |        |      |  ✓ §  |
+| memory-map listing  |         |   ✓    |        |      |  ✓ ‡  |
+| syscall statistics  |         |   ✓    |        |      |  ✓    |
+| instruction hooks   |         |   ✓    |        |      |  ✓    |
+| multithreading      |         |   ✓    |        |      |       |
+| reverse execution   |         |        |  ✓ †   |      |       |
+| call stack          |         |        |  ✓ †   |      |       |
+| wide registers      |         |        |  ✓ †   |      |       |
+| Linux OS emulation  |         |   ✓    |  ✓ †   |      |  ✓    |
+| block coverage      |         |        |  ✓ †   |      |       |
+| GDB remote stub     |         |        |  ✓ †   |      |       |
 
 † Icicle feature available with the extended binding (`icicle_ext/`); see below.
+‡ Sogen: disassembly is via capstone; symbolization and memory-map listing come
+from loaded modules' export tables / image bases (run the program first).
+§ Sogen I/O is stdout/stderr capture; feeding stdin is not exposed by its API.
 
 ### Known boundaries
 
@@ -230,6 +240,14 @@ framework:
   `emu_call`/`emu_eval` to drive it if you have one attached.
 - **Icicle JIT internals and the native AFL trace format** have no useful Python
   mapping (the server ships its own `emu_fuzz` loop); see `icicle_ext/README.md`.
+- **Sogen** emulates Windows and Linux user mode. Windows targets need a prepared
+  emulation root (system DLLs + registry, e.g. `https://sogen.dev/root.zip`);
+  Linux can use the host `/`. A few things are bounded by Sogen's Python API, not
+  by this wrapper: feeding **stdin** isn't exposed (stdout/stderr capture is), and
+  it offers no full memory-region enumeration — so `emu_memory_maps` /
+  `emu_memory_search` cover the loaded-module regions, and a byte-pattern search of
+  anonymous allocations/stack means reading a known range yourself. Symbolization
+  resolves exported/dynamic symbols from loaded modules.
 
 Anything not yet a first-class tool is still reachable through the reflective
 tools (`emu_describe` / `emu_call` / `emu_eval`, below).

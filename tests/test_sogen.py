@@ -9,7 +9,10 @@ Run standalone: python tests/test_sogen.py
 """
 
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -22,6 +25,18 @@ except ImportError:
 
 if HAS_SOGEN:
     from engines.sogen_engine import SogenEngine, _norm_arch, _resolve_backend
+
+HAS_GCC = shutil.which("gcc") is not None
+
+# A freestanding, statically-linked x86-64 ELF: raw write() + exit(42) syscalls,
+# no libc. Loads fast and deterministically, yet exercises binary loading, OS
+# syscall emulation, stdout capture, module loading and symbolization (_start).
+_FREESTANDING_C = r'''
+static long sw(long fd,const void*b,long n){long r;__asm__ volatile(
+  "syscall":"=a"(r):"a"(1),"D"(fd),"S"(b),"d"(n):"rcx","r11","memory");return r;}
+static void sx(long c){__asm__ volatile("syscall"::"a"(60),"D"(c));}
+void _start(void){const char m[]="hi from sogen test\n";sw(1,m,sizeof(m)-1);sx(42);}
+'''
 
 # The engine registry is import-light and must list sogen whether or not the
 # backing package is installed.
@@ -169,11 +184,117 @@ class TestSogenEngine(unittest.TestCase):
         self.assertEqual(out["stdout"], "")
         self.assertEqual(out["stderr"], "")
 
-    def test_memory_search_is_honest(self):
-        # Sogen exposes no region enumeration; search must say so rather than
-        # silently return nothing.
-        with self.assertRaises(NotImplementedError):
-            self.eng.memory_search(b"\x90")
+    def test_disassemble_via_capstone(self):
+        self.assertIn("disassembly", self.eng.CAPABILITIES)
+        self.eng.memory_map(_CODE_BASE, 0x1000, perms=7)
+        self.eng.memory_write(_CODE_BASE, _CODE)       # mov rax,0x2a ; nop ; inc rax
+        dis = self.eng.disassemble(_CODE_BASE, 3)
+        self.assertEqual(len(dis), 3)
+        self.assertTrue(dis[0]["instruction"].startswith("mov"))
+        self.assertEqual(dis[1]["mnemonic"], "nop")
+
+    def test_memory_search_scans_module_regions(self):
+        # No modules loaded in an empty emulator -> nothing to scan, empty list
+        # (not an error). The real search is exercised in TestSogenBinary.
+        self.assertEqual(self.eng.memory_search(b"\x90"), [])
+
+    def test_memory_stats(self):
+        st = self.eng.memory_stats()
+        self.assertIn("region_count", st)
+
+
+@unittest.skipUnless(HAS_SOGEN, "sogen not installed")
+class TestSogenBackends(unittest.TestCase):
+    def test_icicle_backend_constructs(self):
+        # The Ghidra SLEIGH specs ship in the sogen package; the engine points
+        # the CWD at them so the icicle backend initializes instead of aborting.
+        eng = SogenEngine(arch="x86_64", ostype="linux", backend="icicle")
+        try:
+            self.assertIn("icicle", eng.app.backend_name.lower())
+        finally:
+            eng.close()
+
+
+@unittest.skipUnless(HAS_SOGEN and HAS_GCC, "sogen or gcc not available")
+class TestSogenBinary(unittest.TestCase):
+    """Real Linux ELF end-to-end: binary loading, OS emulation, symbolization."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="sogen-test-")
+        src = os.path.join(cls.tmp, "free.c")
+        cls.bin = os.path.join(cls.tmp, "free")
+        with open(src, "w") as f:
+            f.write(_FREESTANDING_C)
+        r = subprocess.run(["gcc", "-nostdlib", "-static", "-no-pie", "-O0",
+                            "-o", cls.bin, src], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise unittest.SkipTest(f"gcc failed: {r.stderr}")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        self.eng = SogenEngine(arch="x86_64", ostype="linux", binary_path=self.bin)
+
+    def tearDown(self):
+        try:
+            self.eng.close()
+        except Exception:
+            pass
+
+    def test_run_captures_stdout_and_exit(self):
+        self.eng.capture_output()
+        res = self.eng.start()
+        self.assertEqual(res["status"], "stopped")
+        self.assertEqual(self.eng.get_output()["stdout"], "hi from sogen test\n")
+        self.assertEqual(self.eng._exit_status(), 42)
+
+    def test_syscall_stats(self):
+        self.eng.start()
+        ss = self.eng.syscall_stats()
+        self.assertGreater(ss["total"], 0)
+        self.assertIn("write", ss["syscalls"])
+
+    def test_list_modules(self):
+        self.eng.start()
+        mods = self.eng.list_modules()
+        self.assertTrue(any(m["name"] == "free" for m in mods))
+        free = next(m for m in mods if m["name"] == "free")
+        self.assertIsNotNone(free["image_base"])
+        self.assertGreater(free["exports"], 0)
+
+    def test_symbolization_roundtrip(self):
+        self.eng.start()
+        self.assertGreater(self.eng.load_symbols(), 0)
+        addr = self.eng.lookup_symbol("_start")
+        self.assertIsNotNone(addr)
+        sym = self.eng.symbolize(addr)
+        self.assertEqual(sym["name"], "_start")
+        self.assertEqual(sym["offset"], 0)
+
+    def test_list_symbols(self):
+        self.eng.start()
+        syms = self.eng.list_symbols()
+        self.assertTrue(any(s["name"] == "_start" for s in syms))
+        self.assertTrue(all(s["address"].startswith("0x") for s in syms))
+
+    def test_memory_maps_and_search(self):
+        self.eng.start()
+        maps = self.eng.memory_maps()
+        self.assertTrue(any(m["label"] == "free" for m in maps))
+        # The ELF header magic lives at the image base of the loaded module.
+        hits = self.eng.memory_search(b"\x7fELF")
+        self.assertGreater(len(hits), 0)
+
+    def test_disassemble_entry(self):
+        self.eng.start()
+        mods = self.eng.list_modules()
+        entry = next(m for m in mods if m["name"] == "free")["entry_point"]
+        dis = self.eng.disassemble(entry, 2)
+        self.assertEqual(len(dis), 2)
+        self.assertTrue(all("instruction" in d for d in dis))
 
 
 if __name__ == "__main__":

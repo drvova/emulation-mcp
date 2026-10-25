@@ -48,8 +48,8 @@ server runs without it. See `requirements-optional.txt`.
 | instruction trace | ✓ | | ✓ | ✓ | |
 | memory trace | ✓ | | | | |
 | snapshots | ✓ | ✓ | ✓ | ✓ | ✓ |
-| memory management | | | ✓ | | |
-| breakpoints | | | ✓ | | ✓ ‡ |
+| memory management | | | ✓ | | ✓ |
+| breakpoints | | | ✓ | | |
 | register introspection | | ✓ | ✓ | | ✓ |
 | native disassembly | | ✓ | ✓ † | | ✓ ‡ |
 | callback hooks | | ✓ | ✓ † | | ✓ |
@@ -62,10 +62,10 @@ server runs without it. See `requirements-optional.txt`.
 | p-code IL | | | ✓ † | | |
 | MMIO regions | | | ✓ † | | |
 | compare logging (RedQueen) | | | ✓ † | | |
-| symbolization | | | ✓ † | | |
+| symbolization | | | ✓ † | | ✓ ‡ |
 | filesystem mapping | | ✓ | | | |
 | stdin / stdout I/O | | ✓ | | | ✓ § |
-| syscall statistics | | ✓ | | | |
+| syscall statistics | | ✓ | | | ✓ |
 | instruction hooks | | ✓ | | | ✓ |
 | multithreading | | ✓ | | | |
 | symbolic execution | | | | ✓ | |
@@ -80,13 +80,14 @@ server runs without it. See `requirements-optional.txt`.
 † Icicle feature available with the extended binding (`icicle_ext/`, built from
 source). The stock `icicle-emu` wheel supports the un-daggered Icicle rows.
 
-‡ Sogen guest ARM64 is supported alongside x86-64. Native disassembly and
-breakpoints come from Sogen's debugger facade, which is present on Linux builds;
-the engine feature-detects them and advertises the capability only when the
-installed binding exposes it.
+‡ Sogen guest ARM64 is supported alongside x86-64. Native disassembly is done
+with capstone on guest bytes (Sogen has no Python disassembler). Symbolization
+resolves against the export tables of loaded modules, so names become available
+once the target and its libraries have loaded (run the program first); it covers
+exported/dynamic symbols, not every static-only local symbol.
 
 § Sogen I/O is stdout/stderr capture (via `on_stdout`/`on_stderr` callbacks);
-feeding stdin is not wired through this engine.
+feeding stdin is not exposed by Sogen's Python API, so it is not wired.
 
 ## Tools by category
 
@@ -152,15 +153,21 @@ feeding stdin is not wired through this engine.
 Sogen drives the shared tools: `emu_create_session` (`engine="sogen"`,
 `ostype="windows"|"linux"`, `binary_path`, `rootfs`=emulation root,
 `engine_options={"backend": "unicorn"|"icicle"}`), then `emu_run` / `emu_step`,
-`emu_memory_read` / `emu_memory_write`, `emu_registers_read` /
-`emu_register_write`, `emu_snapshot_*`. In addition it exposes:
+`emu_memory_read` / `emu_memory_write` / `emu_memory_map` / `emu_memory_protect`
+/ `emu_memory_unmap`, `emu_registers_read` / `emu_register_write`,
+`emu_snapshot_*`. In addition it exposes:
 - `emu_list_registers` — full x86-64 / ARM64 register file (`'register_introspection'`)
-- `emu_hook_address` and the callback hooks (`add_code_hook` / `add_block_hook` /
-  `add_mem_hook` / `add_intr_hook` / `hook_insn`) via `emu_eval` (`'callback_hooks'`, `'memory_hooks'`)
+- `emu_disassemble` — native disassembly (capstone) of guest code (`'disassembly'`)
+- `emu_load_symbols` / `emu_symbolize` / `emu_lookup_symbol` / `emu_list_symbols`
+  — resolve addresses ↔ names from loaded modules' exports (`'symbols'`)
+- `emu_modules` — list loaded modules (exe + shared objects/DLLs) with base/exports
+- `emu_syscall_stats` — syscall histogram gathered during the run
+- `emu_memory_maps` — loaded-module regions; `emu_read_string` — NUL-terminated strings
 - `emu_hook_api` — intercept a Windows API (`kernel32!Sleep`) or Linux symbol (`'api_hooks'`)
 - `emu_capture_output` — capture the guest's stdout/stderr (`'io'`)
-- `emu_disassemble` / `emu_breakpoint_add` — when the Linux debugger facade is present
-- `emu_memory_maps` / `emu_read_string` — region listing and string reads
+- `emu_hook_address` and the callback hooks (`add_code_hook` / `add_block_hook` /
+  `add_mem_hook` (incl. `kind="violation"`) / `add_intr_hook` / `hook_insn`) via
+  `emu_eval` (`'callback_hooks'`, `'memory_hooks'`)
 
 ### Symbolic execution & static analysis (angr)
 - `emu_set_symbolic_register` / `emu_set_symbolic_memory` — make inputs symbolic

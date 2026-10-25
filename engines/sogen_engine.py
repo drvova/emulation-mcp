@@ -28,10 +28,14 @@ Binding notes (the official ``sogen`` PyPI package, ``import sogen``):
   construction so the wrapper tracks the installed binding rather than assuming.
 * Snapshots use ``serialize_state()``/``deserialize_state()`` (opaque bytes),
   which gives the many-named-snapshots semantics BaseEngine expects.
-* The default ``unicorn`` backend works out of the box.  The ``icicle`` backend
-  additionally needs Ghidra's SLEIGH processor specs reachable from the working
-  directory (``./Ghidra/Processors/.../*.ldefs``); without them it aborts inside
-  the Rust layer, so prefer ``unicorn`` unless those specs are present.
+* Both CPU backends work.  The ``icicle`` backend needs Ghidra's SLEIGH
+  processor specs reachable from the working directory
+  (``./Ghidra/Processors/.../*.ldefs``); those ship inside the sogen package, so
+  the wrapper constructs the icicle emulator with the CWD pointed at them.
+* Sogen has no Python disassembler (its debugger facade has no constructor), so
+  ``disassemble`` uses capstone on guest bytes.  Symbolization is served from the
+  export tables of loaded modules (``on_module_load``); syscalls are counted by an
+  always-on ``on_syscall`` observer.  Both are collected automatically.
 * Capabilities are feature-detected per instance: the wrapper advertises a
   capability only when the installed binding actually exposes the backing API
   (e.g. ``memory_management`` when the MMU has ``protect_memory``/``release_memory``).
@@ -43,11 +47,22 @@ not installed.
 """
 
 import time
+import contextlib
+import os
 from typing import Any, Callable
 
 import sogen
 
 from .base import BaseEngine, HookInfo, SnapshotInfo, TraceEntry
+
+# Capstone is a core dependency; Sogen has no native disassembler reachable from
+# Python (its debugger facade has no constructor), so we disassemble guest bytes
+# ourselves.  x86-64 and ARM64 are the Sogen guest architectures.
+try:
+    from capstone import Cs, CS_ARCH_X86, CS_ARCH_ARM64, CS_MODE_64, CS_MODE_ARM
+    _HAS_CAPSTONE = True
+except ImportError:  # pragma: no cover - capstone is in requirements.txt
+    _HAS_CAPSTONE = False
 
 
 # Architecture string -> (register-enum module attribute on `sogen`).
@@ -59,6 +74,16 @@ ARCH_REG_MODULE: dict[str, str] = {
     "arm64": "arm64",    # sogen.arm64.Register
     "aarch64": "arm64",
 }
+
+# Capstone arch/mode per Sogen guest arch, for disassemble().
+_CS_MAP: dict[str, tuple] = {}
+if _HAS_CAPSTONE:
+    _CS_MAP = {
+        "x86_64": (CS_ARCH_X86, CS_MODE_64),
+        "x8664": (CS_ARCH_X86, CS_MODE_64),
+        "arm64": (CS_ARCH_ARM64, CS_MODE_ARM),
+        "aarch64": (CS_ARCH_ARM64, CS_MODE_ARM),
+    }
 
 # Common registers per architecture for registers_read_all().
 COMMON_REGS: dict[str, list[str]] = {
@@ -72,6 +97,17 @@ COMMON_REGS["aarch64"] = COMMON_REGS["arm64"]
 # Default instruction budget for a top-level run (bounds runaway programs; the
 # Python API has no wall-clock stop).  Overridable per call / per engine option.
 DEFAULT_INSN_LIMIT = 50_000_000
+
+
+@contextlib.contextmanager
+def _chdir(path: str):
+    """Temporarily change the working directory (restored on exit)."""
+    old = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)
 
 
 def _norm_arch(arch: str) -> str:
@@ -134,6 +170,10 @@ class SogenEngine(BaseEngine):
         # Output-capture buffers populated by capture_output().
         self._cap_stdout: bytearray | None = None
         self._cap_stderr: bytearray | None = None
+        # Always-on observers (cheap): syscall histogram + loaded-module list.
+        self._syscall_counts: dict[str, int] = {}
+        self._syscall_total = 0
+        self._modules: list[Any] = []
 
         if self.ostype not in ("windows", "linux"):
             raise ValueError(f"Sogen ostype must be 'windows' or 'linux', got '{ostype}'")
@@ -142,6 +182,13 @@ class SogenEngine(BaseEngine):
         root = emulation_root or rootfs
         if self.ostype == "linux" and not root:
             root = "/"   # Linux mode can run against the host filesystem.
+
+        # Sogen resolves the executable path *inside* the emulation root, so a
+        # host binary under root "/" must be given as an absolute host path.
+        bpath = self.binary_path
+        if bpath and self.ostype == "linux" and root == "/" and os.path.exists(bpath):
+            bpath = os.path.abspath(bpath)
+        self._bpath = bpath
 
         self._os_mod = sogen.linux if self.ostype == "linux" else sogen.windows
         backend_member = _resolve_backend(backend)
@@ -152,13 +199,14 @@ class SogenEngine(BaseEngine):
             raise RuntimeError(
                 f"Failed to initialize Sogen ({self.ostype}/{self.arch}, "
                 f"backend={backend}): {type(e).__name__}: {e}\n"
-                f"binary='{binary_path}', emulation_root='{root}'. "
+                f"binary='{bpath}', emulation_root='{root}'. "
                 f"Windows emulation needs a prepared root (system DLLs + registry, "
                 f"e.g. https://sogen.dev/root.zip); Linux emulation can use '/'."
             ) from e
 
         # Probe where the binding puts its accessors / namespaces.
         self._emu = self._resolve_emulator(self.app)
+        self._install_observers()
         self._detect_features()
 
         if enable_trace:
@@ -166,18 +214,33 @@ class SogenEngine(BaseEngine):
 
     # -- Construction helpers --
 
+    # The icicle backend loads Ghidra SLEIGH specs from "./Ghidra/..." relative
+    # to the working directory; they ship inside the sogen package, so construct
+    # the emulator with the CWD pointed there.
+    _PKG_DIR = os.path.dirname(sogen.__file__)
+
     def _construct_app(self, root: str, backend_member: Any) -> Any:
         """Create the application/empty emulator via the os-specific factory."""
+        needs_ghidra_cwd = (
+            backend_member is not None
+            and str(getattr(backend_member, "name", backend_member)).lower().find("icicle") != -1
+            and os.path.isdir(os.path.join(self._PKG_DIR, "Ghidra"))
+        )
+        ctx = _chdir(self._PKG_DIR) if needs_ghidra_cwd else contextlib.nullcontext()
+        with ctx:
+            return self._do_construct(root, backend_member)
+
+    def _do_construct(self, root: str, backend_member: Any) -> Any:
         kwargs: dict[str, Any] = {}
         if root:
             kwargs["emulation_root"] = root
         if backend_member is not None:
             kwargs["backend"] = backend_member
 
-        if self.binary_path:
+        if self._bpath:
             if self.ostype == "windows" and self._args:
-                return self._os_mod.create_application(self.binary_path, args=self._args, **kwargs)
-            return self._os_mod.create_application(self.binary_path, **kwargs)
+                return self._os_mod.create_application(self._bpath, args=self._args, **kwargs)
+            return self._os_mod.create_application(self._bpath, **kwargs)
         return self._os_mod.create_empty(**kwargs)
 
     @staticmethod
@@ -223,10 +286,41 @@ class SogenEngine(BaseEngine):
         # Runtime memory management (protect/release) when the MMU exposes it.
         if memory is not None and hasattr(memory, "protect_memory") and hasattr(memory, "release_memory"):
             caps.add("memory_management")
+        # Disassembly is done with capstone (Sogen has no Python disassembler).
+        if _HAS_CAPSTONE and self.arch in _CS_MAP:
+            caps.add("disassembly")
+        # Symbolization is served from loaded modules' export tables.
+        if self._has_callbacks:
+            caps.add("symbols")
 
         self.CAPABILITIES = frozenset(caps)
         self._apis = apis
         self._symbols = symbols
+
+    def _install_observers(self) -> None:
+        """Wire always-on, low-cost callbacks: syscall counts + module list.
+
+        Registering these at construction means syscall_stats() and
+        symbolization work after any run without extra setup.  Callback shapes
+        (validated against the real binding): on_syscall(number:int, name:str),
+        on_module_load(module).
+        """
+        cb = getattr(self.app, "callbacks", None)
+        if cb is None:
+            return
+        if hasattr(cb, "on_syscall"):
+            def _on_syscall(number: int = 0, name: str = "", *rest: Any) -> None:
+                key = name or f"syscall_{number}"
+                self._syscall_counts[key] = self._syscall_counts.get(key, 0) + 1
+                self._syscall_total += 1
+                if self.tracing_enabled:
+                    self._append_trace(TraceEntry(trace_type="syscall", name=key))
+            cb.on_syscall = _on_syscall
+        if hasattr(cb, "on_module_load"):
+            def _on_module(module: Any = None, *rest: Any) -> None:
+                if module is not None:
+                    self._modules.append(module)
+            cb.on_module_load = _on_module
 
     # -- Register resolution --
 
@@ -390,24 +484,73 @@ class SogenEngine(BaseEngine):
             raise RuntimeError(f"Memory protect failed at 0x{address:x} (size=0x{size:x})")
 
     def memory_search(self, pattern: bytes) -> list[int]:
-        """Not supported: Sogen's Python API exposes no region enumeration.
+        """Search the loaded-module regions for `pattern`.
 
-        There is no way to list all mapped regions, so a whole-address-space
-        search cannot be bounded.  Read a known range with memory_read and search
-        the bytes yourself, or query one region's extent with region_info().
+        Sogen's Python API exposes no full region list, so this scans the
+        regions of the loaded modules (exe + shared objects) reported via
+        memory_maps().  Anonymous allocations and the stack/heap are not
+        enumerable and so are not covered; read a known range with memory_read
+        and search it yourself for those.
         """
-        raise NotImplementedError(
-            "Sogen exposes no memory-region enumeration, so whole-space search is "
-            "unavailable; read a known range (emu_memory_read) and search it instead."
-        )
+        self._touch()
+        found: list[int] = []
+        for region in self.memory_maps():
+            start, end = region.get("start"), region.get("end")
+            if not start or not end or end <= start:
+                continue
+            try:
+                blob = bytes(self._emu.read_memory(start, end - start))
+            except Exception:
+                continue
+            off = blob.find(pattern)
+            while off != -1:
+                found.append(start + off)
+                off = blob.find(pattern, off + 1)
+        return found
 
-    def region_info(self, address: int) -> dict[str, Any]:
-        """Describe the mapped region that contains `address` (Sogen-specific)."""
+    def memory_maps(self) -> list[dict[str, Any]]:
+        """List the loaded modules as mapped regions (exe + shared objects).
+
+        Sogen exposes no general region enumeration, but every loaded module
+        reports its image base and size, which is where the binary and its
+        libraries landed -- the most useful part of a memory map.
+        """
+        self._touch()
+        out: list[dict[str, Any]] = []
+        for m in self._modules:
+            base = getattr(m, "image_base", None)
+            size = getattr(m, "size_of_image", None)
+            if base is None:
+                continue
+            out.append({
+                "start": base,
+                "end": (base + size) if size else base,
+                "perms": "r-x",
+                "label": str(getattr(m, "name", "")),
+                "path": str(getattr(m, "path", "") or ""),
+            })
+        return out
+
+    def memory_stats(self) -> dict[str, Any]:
+        """Return Sogen's memory summary (region_count, mapped/executable bytes)."""
+        self._touch()
+        mem = getattr(self.app, "memory", None)
+        if mem is None or not hasattr(mem, "compute_memory_stats"):
+            raise NotImplementedError("This Sogen binding exposes no memory stats")
+        return dict(mem.compute_memory_stats())
+
+    def region_info(self, address: int) -> dict[str, Any] | None:
+        """Describe the mapped region that contains `address` (Sogen-specific).
+
+        Returns None when `address` is not mapped.
+        """
         self._touch()
         mem = getattr(self.app, "memory", None)
         if mem is None or not hasattr(mem, "get_region_info"):
             raise NotImplementedError("This Sogen binding exposes no region info")
         ri = mem.get_region_info(address)
+        if ri is None:
+            return None
         start = getattr(ri, "start", None)
         length = getattr(ri, "length", None)
         return {
@@ -432,6 +575,145 @@ class SogenEngine(BaseEngine):
         if nul != -1:
             raw = raw[:nul]
         return raw.decode("utf-8", errors="replace")
+
+    # -- Syscalls, modules, symbolization (OS-emulation introspection) --
+
+    def syscall_stats(self) -> dict[str, Any]:
+        """Return the syscall histogram gathered during the run(s).
+
+        Counts are accumulated by the always-on on_syscall observer, so this
+        works after any emu_run/emu_step without extra setup.
+        """
+        self._touch()
+        return {
+            "syscalls": dict(self._syscall_counts),
+            "total": self._syscall_total,
+            "strings": [],
+        }
+
+    def list_modules(self) -> list[dict[str, Any]]:
+        """List the modules loaded so far (exe + shared objects/DLLs)."""
+        self._touch()
+        out: list[dict[str, Any]] = []
+        for m in self._modules:
+            exports = getattr(m, "exports", None)
+            try:
+                nexp = len(exports) if exports is not None else 0
+            except Exception:
+                nexp = 0
+            out.append({
+                "name": str(getattr(m, "name", "")),
+                "image_base": getattr(m, "image_base", None),
+                "entry_point": getattr(m, "entry_point", None),
+                "size": getattr(m, "size_of_image", None),
+                "path": str(getattr(m, "path", "") or ""),
+                "exports": nexp,
+            })
+        return out
+
+    def _iter_exports(self):
+        """Yield (module, ExportedSymbol) for every export of every module."""
+        for m in self._modules:
+            exports = getattr(m, "exports", None)
+            if not exports:
+                continue
+            for s in exports:
+                yield m, s
+
+    def load_symbols(self, path: str = "", load_address: int = 0) -> int:
+        """Report the number of symbols available from loaded modules.
+
+        Sogen collects symbols automatically as modules load (the always-on
+        observer), so no explicit load step is needed.  Returns the current
+        export count across all loaded modules.
+        """
+        self._touch()
+        return sum(1 for _ in self._iter_exports())
+
+    def symbolize(self, address: int) -> dict[str, Any] | None:
+        """Resolve an address to {name, offset, address, source} via module exports."""
+        self._touch()
+        best = None  # (export_addr, name, module_name)
+        for m, s in self._iter_exports():
+            sa = getattr(s, "address", None)
+            if sa is None or sa > address:
+                continue
+            if best is None or sa > best[0]:
+                best = (sa, str(getattr(s, "name", "")), str(getattr(m, "name", "")))
+        if best is None:
+            return None
+        return {
+            "name": best[1],
+            "offset": address - best[0],
+            "address": best[0],
+            "source": best[2],   # owning module name
+        }
+
+    def lookup_symbol(self, name: str) -> int | None:
+        """Resolve a symbol name to its address via module exports."""
+        self._touch()
+        for _m, s in self._iter_exports():
+            if str(getattr(s, "name", "")) == name:
+                return getattr(s, "address", None)
+        return None
+
+    def list_symbols(self) -> list[dict[str, Any]]:
+        """List exported symbols from loaded modules as {address, name, size, kind}."""
+        self._touch()
+        out: list[dict[str, Any]] = []
+        for m, s in self._iter_exports():
+            addr = getattr(s, "address", None)
+            if addr is None:
+                continue
+            out.append({
+                "address": f"0x{addr:x}",
+                "name": str(getattr(s, "name", "")),
+                "size": 0,                       # export tables carry no size
+                "kind": str(getattr(m, "name", "")),  # owning module
+            })
+        return out
+
+    # -- Disassembly (via capstone; Sogen has no Python disassembler) --
+
+    def disassemble(self, address: int, count: int = 1) -> list[dict[str, Any]]:
+        self._touch()
+        if not _HAS_CAPSTONE or self.arch not in _CS_MAP:
+            raise NotImplementedError(f"No capstone disassembler for Sogen arch '{self.arch}'")
+        arch, mode = _CS_MAP[self.arch]
+        md = Cs(arch, mode)
+        try:
+            code = bytes(self._emu.read_memory(address, max(count, 1) * 15 + 16))
+        except Exception as e:
+            raise RuntimeError(f"Disassembly read failed at 0x{address:x}: {e}") from e
+        out: list[dict[str, Any]] = []
+        for insn in md.disasm(code, address):
+            out.append({
+                "address": f"0x{insn.address:x}",
+                "instruction": f"{insn.mnemonic} {insn.op_str}".strip(),
+                "mnemonic": insn.mnemonic,
+                "op_str": insn.op_str,
+                "size": insn.size,
+                "bytes": insn.bytes.hex(),
+            })
+            if len(out) >= count:
+                break
+        return out
+
+    def list_threads(self) -> dict[str, Any]:
+        """Report the guest's process/thread state (fields are OS-dependent)."""
+        self._touch()
+        p = getattr(self.app, "process", None)
+        count = getattr(p, "live_thread_count", None) if p is not None else None
+        if count is None:
+            return {"note": "Sogen exposes only exit status on this OS "
+                            f"(exit_status={self._exit_status()})",
+                    "multithread": None}
+        return {
+            "count": count,
+            "current": getattr(self.app, "current_thread_id", None),
+            "threads": [],
+            "spawned": getattr(p, "spawned_thread_count", None),
+        }
 
     # -- Registers --
 
@@ -528,12 +810,19 @@ class SogenEngine(BaseEngine):
         self._touch()
         if not self._has_hooks:
             raise NotImplementedError("This Sogen binding exposes no memory hooks")
+        # kind="violation" fires on access faults (no range); it takes just a cb.
+        if kind == "violation":
+            vfn = getattr(self.app.hooks, "memory_violation", None)
+            if vfn is None:
+                raise NotImplementedError("This Sogen binding exposes no memory-violation hook")
+            handle = vfn(callback)
+            return self._store_hook("mem_violation", "all", "Memory violation hook", handle)
         hookfn = {
             "read": getattr(self.app.hooks, "memory_read", None),
             "write": getattr(self.app.hooks, "memory_write", None),
         }.get(kind)
         if hookfn is None:
-            raise ValueError(f"kind must be 'read' or 'write' (Sogen), got {kind!r}")
+            raise ValueError(f"kind must be 'read', 'write' or 'violation' (Sogen), got {kind!r}")
         base = start if start is not None else 0
         size = (end - base) if (end is not None and end > base) else 0x1000
         handle = hookfn(base, size, callback)

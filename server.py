@@ -2056,6 +2056,37 @@ def emu_list_symbols(session_id: str, filter: str = "", limit: int = 100) -> str
 
 
 @mcp.tool()
+def emu_modules(session_id: str) -> str:
+    """List the modules loaded in the guest (Sogen).
+
+    Shows each loaded module (the executable and its shared objects/DLLs) with
+    its image base, entry point, size and export count — useful to see what the
+    loader brought in and where it landed. Run the program first so the loader
+    has mapped its libraries.
+
+    session_id: Active session ID.
+    """
+    try:
+        engine = sessions.get(session_id)
+        mods = engine.list_modules()
+        if not mods:
+            return "No modules loaded (run the program first)."
+        lines = [f"Modules ({len(mods)}):"]
+        for m in mods:
+            base = m.get("image_base")
+            base_s = f"0x{base:x}" if isinstance(base, int) else str(base)
+            lines.append(f"  {base_s}  {m.get('name','')}  "
+                         f"(exports {m.get('exports', 0)}, size {m.get('size')})")
+        return "\n".join(lines)
+    except NotImplementedError as e:
+        return f"Error: {e}"
+    except KeyError as e:
+        return str(e)
+    except Exception as e:
+        return f"Modules error: {e}"
+
+
+@mcp.tool()
 def emu_memory_maps(session_id: str) -> str:
     """List the guest's mapped memory regions (Qiling).
 
