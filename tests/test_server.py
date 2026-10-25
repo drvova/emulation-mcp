@@ -832,5 +832,45 @@ class TestQilingThroughServer(unittest.TestCase):
             _fn(server.emu_close_session)(sid)
 
 
+class TestToolSurface(unittest.TestCase):
+    """The advertised surface is a lean generic core; the typed catalog is opt-in."""
+
+    def _advertised(self):
+        import asyncio
+        return {t.name for t in asyncio.run(server.mcp.list_tools())}
+
+    def test_core_always_advertised(self):
+        names = self._advertised()
+        self.assertTrue(server.CORE_TOOLS <= names,
+                        f"missing core tools: {server.CORE_TOOLS - names}")
+        # The composable core must include introspection + invocation.
+        for t in ("emu_describe", "emu_call", "emu_create_session", "emu_run"):
+            self.assertIn(t, names)
+
+    def test_typed_tools_gated_by_default(self):
+        names = self._advertised()
+        if server._EXPOSE_TYPED:
+            # Flag on: the full catalog is advertised.
+            self.assertIn("emu_symbolize", names)
+        else:
+            # Flag off (default): only the core is advertised...
+            self.assertEqual(names, set(server.CORE_TOOLS))
+            self.assertNotIn("emu_symbolize", names)
+        # ...but every typed function stays defined on the module either way,
+        # so it is reachable via emu_call and importable by tests.
+        self.assertTrue(callable(_fn(server.emu_symbolize)))
+
+    def test_describe_reports_capabilities_and_signatures(self):
+        sid = _new_session(engine="unicorn", arch="x86_64")
+        try:
+            out = _fn(server.emu_describe)(sid, target="engine", filter="memory")
+            self.assertIn("Capabilities (", out)
+            # A real, typed signature (not a bare "name()") must appear.
+            self.assertIn("memory_read(", out)
+            self.assertIn("-> bytes", out)
+        finally:
+            _fn(server.emu_close_session)(sid)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

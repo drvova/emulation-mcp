@@ -11,6 +11,31 @@ marked. Capability names in parentheses (e.g. `'coverage'`) are the flags a
 session advertises; a tool checks the flag and reports if the engine doesn't
 have it.
 
+## Tool surface: lean core, opt-in catalog
+
+A big fixed catalog of typed tools is not the primary interface. Engines, archs
+and installs each support a different subset of capabilities, so by **default**
+the server advertises a small, engine-agnostic **core** plus the generic
+introspection trio, and a model reaches everything else by discovering a
+session's real surface and invoking it:
+
+- **Core (always advertised):** `emu_create_session`, `emu_list_sessions`,
+  `emu_close_session`, `emu_list_engines`, `emu_run`, `emu_step`,
+  `emu_memory_read`, `emu_memory_write`, `emu_memory_map`, `emu_registers_read`,
+  `emu_register_write`, and the trio `emu_describe` / `emu_call` / `emu_eval`.
+- **`emu_describe`** reports a session's **live capabilities** and every method's
+  **signature** (from `inspect`, or the docstring for native methods), so the
+  model knows exactly what this engine/arch supports and how to call it.
+- **`emu_call`** then invokes any of those methods (JSON args, hex/bytes
+  coercions) — reaching the full engine API (hooks, snapshots, symbolization,
+  CFG, fuzzing, …) with no dedicated tool per capability.
+
+Set **`EMU_EXPOSE_TYPED_TOOLS=1`** to *also* advertise the full catalog of
+explicit `emu_*` verbs documented below (for clients or models that prefer
+discoverable, typed verbs). The flag only changes what is **advertised** — every
+`emu_*` function exists regardless and stays reachable through `emu_call`. The
+rest of this document lists that full catalog.
+
 ## Engines
 
 | Engine | Role | Typical input | Notes |
@@ -189,14 +214,24 @@ Sogen drives the shared tools: `emu_create_session` (`engine="sogen"`,
 - `emu_list_engines` — installed engines and live capabilities
 - `emu_compare_engines` — Unicorn vs Icicle differential on the same shellcode
 
-### Reaching the rest (any engine)
-Anything not yet a first-class tool is still reachable:
-- `emu_describe` — list every method/attribute on a session's engine object
-- `emu_call` — invoke any of them by name (JSON args with hex/bytes coercions; private members blocked)
+### The generic core (always advertised)
+This trio is the primary interface (see **Tool surface** above): it reaches the
+full engine API without a dedicated tool per capability, and is all a model
+needs even when the typed catalog is not advertised.
+- `emu_describe` — a session's **live capabilities** plus every method's
+  **signature** and one-line doc. Start here to learn what an engine/arch
+  supports and how to call it.
+- `emu_call` — invoke any of those methods by name (JSON args with hex/bytes
+  coercions; private members blocked). Drives hooks, snapshots, symbolization,
+  CFG, fuzzing, … on any engine.
 - `emu_eval` — run a Python snippet against the session. This executes arbitrary
   Python in the server process, so it is **off by default**; enable it only in a
   trusted local setup with `EMU_ENABLE_EVAL=1`. It is the way to drive the
   callback-based APIs (hooks, MMIO) that can't cross the JSON tool boundary.
+
+The typed `emu_*` verbs listed throughout this document are advertised only when
+`EMU_EXPOSE_TYPED_TOOLS=1`; otherwise invoke them (or the engine methods behind
+them) through `emu_call`.
 
 ## See also
 

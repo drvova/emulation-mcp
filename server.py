@@ -11,6 +11,7 @@ Usage:
 import sys
 import os
 import re
+import inspect
 import subprocess
 import json
 import threading
@@ -42,12 +43,75 @@ mcp = FastMCP(
         "1. Create a session with emu_create_session (pick an engine + arch)\n"
         "2. For CPU engines: map memory, write code, run\n"
         "3. For Qiling: point at binary + rootfs, hook syscalls/APIs, run\n"
-        "4. For angr: write code, make inputs symbolic, emu_explore to a target, emu_solve\n"
-        "5. Inspect registers, memory, trace; use snapshots to save/restore state"
+        "4. For angr: write code, make inputs symbolic, explore to a target, solve\n"
+        "5. Inspect registers, memory, trace; use snapshots to save/restore state\n\n"
+        "Tool surface: a small generic CORE is advertised (session lifecycle, run/step,\n"
+        "memory/register access) together with the introspection trio -- emu_describe\n"
+        "lists a session's live capabilities and each method's signature, and emu_call\n"
+        "invokes any of them. This reaches the FULL engine API (hooks, snapshots,\n"
+        "symbolization, CFG, fuzzing, ...) without a dedicated tool per capability, which\n"
+        "matters because engines/archs support different subsets. Discover with\n"
+        "emu_describe, then drive with emu_call. Set EMU_EXPOSE_TYPED_TOOLS=1 to also\n"
+        "advertise the full catalog of explicit emu_* verbs."
     ),
 )
 
 sessions = SessionManager()
+
+# ---------------------------------------------------------------------------
+# Tool surface: a lean generic core, advertised by default; the full typed
+# catalog is opt-in.
+# ---------------------------------------------------------------------------
+# A large fixed catalog of typed tools is the wrong primary interface: every
+# engine/arch/install supports a different subset, and hand-wiring one verb per
+# capability neither scales nor lets a capable model build its own tooling. So
+# by default the server advertises only a small, engine-agnostic CORE and the
+# generic introspection trio (emu_describe / emu_call / emu_eval). A model
+# inspects a session with emu_describe -- which now reports the engine's live
+# capabilities and each method's signature -- and drives the full engine API
+# through emu_call, so the advertised list need not enumerate capabilities that
+# vary per engine.
+#
+# Set EMU_EXPOSE_TYPED_TOOLS=1 to additionally advertise the whole typed catalog
+# (emu_hook_*, emu_snapshot_*, emu_symbolize, emu_cfg, emu_fuzz, ...) for clients
+# or models that prefer explicit, discoverable verbs. Either way every emu_*
+# function stays defined on this module, so nothing is lost: the un-advertised
+# ones remain reachable via emu_call and importable by tests.
+_EXPOSE_TYPED = os.getenv("EMU_EXPOSE_TYPED_TOOLS", "0").strip().lower() not in (
+    "", "0", "false", "no", "off",
+)
+
+CORE_TOOLS: frozenset[str] = frozenset({
+    # session lifecycle + discovery
+    "emu_create_session", "emu_list_sessions", "emu_close_session", "emu_list_engines",
+    # execution
+    "emu_run", "emu_step",
+    # raw memory + registers
+    "emu_memory_read", "emu_memory_write", "emu_memory_map",
+    "emu_registers_read", "emu_register_write",
+    # generic introspection + invocation (the composable core)
+    "emu_describe", "emu_call", "emu_eval",
+})
+
+_mcp_tool = mcp.tool  # the real FastMCP decorator factory
+
+
+def _gated_tool(*dargs, **dkwargs):
+    """Intercept ``@mcp.tool()`` so registration is core/flag gated.
+
+    A tool is advertised over MCP when its function name is in CORE_TOOLS or
+    when EMU_EXPOSE_TYPED_TOOLS is set; otherwise the function is defined on the
+    module but not registered. This keeps the default tool surface small without
+    editing (or losing) any of the typed tools.
+    """
+    def deco(fn):
+        if getattr(fn, "__name__", "") in CORE_TOOLS or _EXPOSE_TYPED:
+            return _mcp_tool(*dargs, **dkwargs)(fn)
+        return fn
+    return deco
+
+
+mcp.tool = _gated_tool  # every @mcp.tool() below routes through the gate
 
 # ---------------------------------------------------------------------------
 # Security & resource limits
@@ -3287,14 +3351,19 @@ def emu_compare_engines(
 
 @mcp.tool()
 def emu_describe(session_id: str, target: str = "native", filter: str = "") -> str:
-    """List the methods and attributes reachable on a session via emu_call.
+    """Discover a session's full surface: capabilities + methods (with signatures).
 
-    This exposes the *entire* surface of an engine, not just the curated tools —
-    use it to discover what emu_call can invoke.
+    This is how the model self-serves instead of relying on one dedicated tool
+    per capability: it reports the engine's live capability flags and every
+    callable's signature, so you know exactly what this engine/arch supports and
+    how to call it via emu_call. Signatures come from inspect when possible, else
+    from the first line of the method's docstring (native/compiled methods carry
+    their signature there).
 
     session_id: Active session ID.
     target: "native" for the underlying emulator object (icicle VM, unicorn Uc,
-      qiling Ql, angr SimState), or "engine" for the wrapper (the emu_* methods).
+      qiling Ql, angr SimState, sogen Emulator), or "engine" for the wrapper
+      (the emu_* methods behind every typed tool).
     filter: Optional case-insensitive substring to narrow the names.
     """
     try:
@@ -3309,15 +3378,18 @@ def emu_describe(session_id: str, target: str = "native", filter: str = "") -> s
             try:
                 member = getattr(obj, n)
             except Exception:
-                attrs.append(n)
+                attrs.append(f"  {n}")
                 continue
             if callable(member):
-                doc = (getattr(member, "__doc__", "") or "").strip().splitlines()
-                methods.append(f"  {n}(){'  — ' + doc[0] if doc else ''}")
+                methods.append(f"  {n}{_describe_signature(member)}{_describe_doc(member)}")
             else:
                 attrs.append(f"  {n} = {_format_value(member)}")
+        caps = sorted(getattr(engine, "CAPABILITIES", ()) or ())
         lines = [f"{engine.engine_type} session, target='{target}' "
                  f"({type(obj).__module__}.{type(obj).__name__}):\n"]
+        lines.append(f"Capabilities ({len(caps)}): {', '.join(caps) or '(none advertised)'}")
+        lines.append("Invoke any method below with emu_call(session_id, method, "
+                     f"args=[...], target='{target}').\n")
         lines.append(f"Methods ({len(methods)}):")
         lines.extend(methods)
         lines.append(f"\nAttributes ({len(attrs)}):")
@@ -3327,6 +3399,37 @@ def emu_describe(session_id: str, target: str = "native", filter: str = "") -> s
         return str(e)
     except Exception as e:
         return f"Describe error: {e}"
+
+
+def _describe_signature(member) -> str:
+    """Best-effort call signature for a method: inspect first, else docstring."""
+    try:
+        return str(inspect.signature(member))
+    except (ValueError, TypeError):
+        # Compiled/native methods (nanobind/pybind/builtins) have no inspectable
+        # signature, but conventionally put it on the first docstring line, e.g.
+        # "read_memory(self, arg0: int, arg1: int, /) -> bytes".
+        doc = (getattr(member, "__doc__", "") or "").strip().splitlines()
+        if doc and "(" in doc[0]:
+            sig = doc[0].split("(", 1)[1]
+            return "(" + sig
+        return "(...)"
+
+
+def _describe_doc(member) -> str:
+    """The method's one-line summary, skipping a leading signature line."""
+    doc = (getattr(member, "__doc__", "") or "").strip().splitlines()
+    if not doc:
+        return ""
+    first = doc[0].strip()
+    # If the first line is just the signature, use the next non-empty line.
+    name = getattr(member, "__name__", "")
+    if name and first.startswith(name + "(") and len(doc) > 1:
+        for line in doc[1:]:
+            if line.strip():
+                return "  — " + line.strip()
+        return ""
+    return "  — " + first
 
 
 @mcp.tool()
