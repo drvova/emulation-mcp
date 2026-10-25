@@ -13,12 +13,12 @@ have it.
 
 ## Tool surface: one code tool
 
-A fixed catalog of typed tools is not the interface. Engines, archs and installs
+The interface is **one tool, `emu`** — there is no catalog of verbs and no way to
+turn one on. A fixed catalog is the wrong interface: engines, archs and installs
 each support a different subset of capabilities, and models differ in which
 tools they have and how well they use them, so privileging any hand-picked set
-biases the system. By **default the server advertises exactly one tool, `emu`**,
-which runs Python in a **persistent namespace** — the model writes code against a
-live API and builds its own tooling, rather than being handed verbs:
+biases the system. `emu` runs Python in a **persistent namespace** — the model
+writes code against a live API and builds its own tooling:
 
 ```
 emu(code="")                                 # the manual + installed engines
@@ -37,15 +37,13 @@ the next call, and — because each definition is written to `HARNESS_DIR` (defa
 `~/.emulation-mcp/harness`) — reloaded after a restart. Drive the full engine API
 (hooks, snapshots, symbolization, CFG, fuzzing, …) straight off `engine`/`native`.
 
-Code runs with the server's authority, so **run the server sandboxed** (a
-container/VM). It is **on by default**; `EMU_DISABLE_CODE=1` turns it off (then
-set `EMU_EXPOSE_TYPED_TOOLS=1` to use the explicit typed verbs instead).
+Running code is what the tool is — it executes with the server's authority, so
+**run the server sandboxed** (a container/VM).
 
-Set **`EMU_EXPOSE_TYPED_TOOLS=1`** to *also* advertise the full catalog of
-explicit `emu_*` verbs documented below (for clients or models that prefer
-discoverable, typed verbs). Every `emu_*` function exists regardless and is
-reachable from code (e.g. `engine.symbolize(addr)`); the rest of this document
-lists that catalog.
+The rest of this document is a **capability reference**, not a tool list: each
+`emu_*` entry below names an engine method you call from `emu` code (e.g.
+`engine.symbolize(addr)`, `engine.memory_read(addr, n)`). These are plain
+functions in the module, not separate MCP tools.
 
 ## Engines
 
@@ -225,10 +223,11 @@ Sogen drives the shared tools: `emu_create_session` (`engine="sogen"`,
 - `emu_list_engines` — installed engines and live capabilities
 - `emu_compare_engines` — Unicorn vs Icicle differential on the same shellcode
 
-### The one tool (always advertised)
+### The one tool
 `emu(code, session_id, strings)` (see **Tool surface** above) is the whole
-interface: it runs Python in a persistent namespace, and the model builds its own
-tooling there. Call with empty `code` for the manual. The namespace provides:
+interface — the only tool there is. It runs Python in a persistent namespace, and
+the model builds its own tooling there. Call with empty `code` for the manual.
+The namespace provides:
 - `engines()` — installed engines + live capabilities.
 - `create(engine, arch, **opts)` — open a session (opts: `binary_path`, `rootfs`,
   `ostype`, `args`, `engine_options`, `label`); returns the id and binds
@@ -246,13 +245,11 @@ Functions/variables you define **persist**: reusable on the next call, and, sinc
 each definition is written to `HARNESS_DIR` (default `~/.emulation-mcp/harness`,
 one file per definition), reloaded after a restart — you accrete a harness
 instead of re-deriving it. End a snippet on an expression to return it, or assign
-`result`. Code runs with the server's authority, so **run the server sandboxed**;
-it is **on by default**, and `EMU_DISABLE_CODE=1` turns it off. `emu_eval` shares
-this same namespace.
+`result`. Running code is what the tool is — it executes with the server's
+authority, so **run the server sandboxed**.
 
-The typed `emu_*` verbs listed throughout this document are advertised only when
-`EMU_EXPOSE_TYPED_TOOLS=1`; otherwise invoke the engine methods behind them from
-code (e.g. `engine.symbolize(addr)`).
+The `emu_*` names listed throughout this document are the engine methods you call
+from `emu` code (e.g. `engine.symbolize(addr)`), not separate tools.
 
 ## See also
 

@@ -77,30 +77,28 @@ primitives beat a large static tool schema.)
    list of available backends/capabilities. The model bootstraps from that, then
    `describe(...)` a working object to see its real surface.
 
-6. **Security posture (state it loudly, make it reversible).** This runs
-   arbitrary code with the server's authority. It is the primary interface, so
-   it is **ON by default** — and the tool description, server instructions and
-   README must say, prominently, to **run the server sandboxed (a container/VM)**.
-   Provide `<ENV_PREFIX>_DISABLE_CODE=1` to turn it off; when off, the tool
-   returns a clear message pointing at the escape hatch in (7). (If the project
-   must default to off for policy reasons, keep the one tool and this switch;
-   just invert the default and say so.)
+6. **Security is a deployment fact, not a toggle.** Running code *is* what the
+   tool is — it executes with the server's authority — so there is **no
+   enable/disable knob and no "default" to reason about**: the tool always runs
+   code, and the server is meant to be run sandboxed (a container/VM). Say that
+   plainly and prominently in the tool description, the server instructions and
+   the README. Do not add an `<ENV_PREFIX>_ENABLE/DISABLE` flag; a flag reframes
+   the design as an optional feature, which it is not.
 
-7. **Optional typed-catalog escape hatch.** Keep the old typed functions defined
-   in the module (do not delete them) but **do not advertise them** unless
-   `<ENV_PREFIX>_EXPOSE_TYPED_TOOLS=1` is set. This serves locked-down
-   deployments (disable code, expose explicit verbs) and clients/models that
-   prefer discoverable schemas. Implement the gate as a thin shim over the tool
-   decorator keyed on an always-on set `{<TOOL_NAME>}`, so you don't edit every
-   existing tool definition.
+7. **One tool, nothing else advertised.** Keep the project's existing capability
+   functions defined in the module (the harness and tests call them) but do
+   **not** register them as MCP tools and do **not** add a flag to advertise
+   them. The only registered tool is `<TOOL_NAME>`. Implement this as a thin shim
+   over the tool decorator that registers only the one name, so you don't have to
+   edit every existing function. The capabilities are reached from code
+   (`working_object.method(...)`), not as verbs.
 
 8. **Wrap existing MCP servers / tools as callable functions** in the namespace
    where applicable (the "tools as code" move), rather than re-advertising them.
 
 ## Acceptance criteria (write tests for these)
 
-- Default advertised tool set is exactly `{<TOOL_NAME>}`; with
-  `<ENV_PREFIX>_EXPOSE_TYPED_TOOLS=1` the full catalog is advertised alongside it.
+- The advertised tool set is exactly `{<TOOL_NAME>}` — one tool, unconditionally.
 - Empty `code` returns a manual that names the namespace vocabulary and lists
   backends/capabilities.
 - A helper defined in one call is reusable in the **next** call without being
@@ -108,18 +106,19 @@ primitives beat a large static tool schema.)
 - A definition made in one process is reloaded and usable in a **fresh process**
   pointed at the same `<ENV_PREFIX>_HARNESS_DIR` (prove restart persistence),
   and `forget(name)` removes it.
-- With code disabled, the tool refuses clearly and names the escape hatch.
-- The pre-existing capability tests still pass (the typed functions remain
-  importable/callable even when unadvertised).
+- The pre-existing capability functions still work when driven from code.
 - Tests isolate `<ENV_PREFIX>_HARNESS_DIR` to a temp dir so they never touch a
   real home directory.
 
 ## Do not
 
-- Do not ship a parallel structured/`action=` interface "for safety" — that is
-  the divergence this design removes. Safe, code-free use is the typed-catalog
-  flag in (7), not a second code-free dispatcher baked into the one tool.
-- Do not delete the underlying capability functions; only stop advertising them.
+- Do not ship a parallel structured/`action=` interface, nor a typed-verb
+  catalog, nor an enable/disable or expose-tools flag. Each of those reframes the
+  one code tool as an optional feature layered on something else; it is the
+  interface, full stop. Safe deployment is sandboxing the server, not a
+  code-free tool mode.
+- Do not delete the underlying capability functions; just don't register them as
+  tools.
 - Do not per-branch the tool set on model identity — adaptation is emergent
   (each deployment's model accretes its own helpers), not a per-model switch.
 
@@ -127,5 +126,6 @@ primitives beat a large static tool schema.)
 
 `emulation-mcp`'s `emu` tool realizes this exactly: `server.py` (`emu`,
 `_harness_ns`, `_run_harness`, `_persist_definitions`, `_load_persisted`, the
-`_gated_tool` shim) and `tests/test_server.py` (`TestToolSurface`). Mirror its
-shape, substituting your `<DOMAIN_API>` for the emulation engines.
+`_gated_tool` shim that registers only `emu`) and `tests/test_server.py`
+(`TestToolSurface`). Mirror its shape, substituting your `<DOMAIN_API>` for the
+emulation engines.

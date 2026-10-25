@@ -49,51 +49,34 @@ mcp = FastMCP(
         "Functions you define PERSIST (reusable next call, and saved to disk across restarts),\n"
         "so you accrete a harness. Drive the FULL engine API off `engine`/`native` (run/step,\n"
         "memory, registers, hooks, snapshots, disassembly, symbolization, CFG, fuzzing,\n"
-        "symbolic exec). Code runs with the server's authority, so run the server sandboxed;\n"
-        "it is on by default (EMU_DISABLE_CODE=1 to disable). EMU_EXPOSE_TYPED_TOOLS=1 also\n"
-        "advertises the explicit emu_* verbs."
+        "symbolic exec). Code runs with the server's authority -- run the server sandboxed\n"
+        "(a container/VM)."
     ),
 )
 
 sessions = SessionManager()
 
 # ---------------------------------------------------------------------------
-# Tool surface: ONE universal tool by default; the typed catalog is opt-in.
+# Tool surface: ONE tool, `emu`. It is the interface, not a feature on top of one.
 # ---------------------------------------------------------------------------
-# A fixed catalog of typed tools is the wrong primary interface. Engines, archs
-# and installs each support a different subset of capabilities, and models
-# differ in which tools they have and how well they wield them -- so privileging
-# any particular hand-picked set biases the system toward some models and some
-# engines. Instead the server advertises exactly ONE tool by default, `emu`,
-# from which a model builds whatever working set it needs: it discovers a
-# session's live capabilities and method signatures, then invokes them. Nothing
-# about a specific capability is baked into the advertised surface.
-#
-# Set EMU_EXPOSE_TYPED_TOOLS=1 to additionally advertise the whole typed catalog
-# (emu_create_session, emu_hook_*, emu_symbolize, emu_cfg, ...) for clients or
-# models that prefer explicit, discoverable verbs. Either way every emu_*
-# function stays defined on this module, so nothing is lost: `emu` dispatches to
-# them, and they remain importable by tests.
-_EXPOSE_TYPED = os.getenv("EMU_EXPOSE_TYPED_TOOLS", "0").strip().lower() not in (
-    "", "0", "false", "no", "off",
-)
-
-# The single tool always advertised. Everything else is reached through it.
-ALWAYS_ON: frozenset[str] = frozenset({"emu"})
-
+# A catalog of typed tools is the wrong interface: every backend/arch/install
+# supports a different subset, and models differ in which tools they have and how
+# well they wield them, so privileging any hand-picked set biases the system.
+# `emu` is the whole interface -- it runs code, and the model builds its own
+# tooling on the live API. The other emu_* functions in this module are NOT
+# tools; they are plain functions that `emu`'s namespace and tests call. Only
+# `emu` is registered with MCP.
 _mcp_tool = mcp.tool  # the real FastMCP decorator factory
 
 
 def _gated_tool(*dargs, **dkwargs):
-    """Intercept ``@mcp.tool()`` so only `emu` is advertised by default.
+    """Intercept ``@mcp.tool()`` so `emu` is the only registered tool.
 
-    A tool is advertised over MCP when its function name is in ALWAYS_ON (just
-    `emu`) or when EMU_EXPOSE_TYPED_TOOLS is set; otherwise the function is
-    defined on the module but not registered. This keeps the default surface a
-    single universal tool without editing (or losing) any of the typed tools.
+    Every other @mcp.tool()-decorated function stays defined on the module (the
+    harness and tests call them) but is not advertised over MCP.
     """
     def deco(fn):
-        if getattr(fn, "__name__", "") in ALWAYS_ON or _EXPOSE_TYPED:
+        if getattr(fn, "__name__", "") == "emu":
             return _mcp_tool(*dargs, **dkwargs)(fn)
         return fn
     return deco
@@ -144,24 +127,13 @@ def _validate_binary_path(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reflective access helpers (emu_call / emu_describe / emu_eval)
+# Reflective access helpers (used by the `emu` code tool)
 # ---------------------------------------------------------------------------
 
-# Code execution is the server's primary interface (the `emu` tool runs Python
-# in a persistent harness), so it is ON by default. It runs arbitrary Python
-# with the server process's authority, so run the server sandboxed (a container
-# or VM). Turn it off with EMU_DISABLE_CODE=1 for locked-down deployments (then
-# pair with EMU_EXPOSE_TYPED_TOOLS=1 to keep the explicit typed verbs usable).
-# The legacy EMU_ENABLE_EVAL, if set explicitly, still wins either way.
-def _code_enabled() -> bool:
-    legacy = os.getenv("EMU_ENABLE_EVAL", "")
-    if legacy != "":
-        return legacy.lower() in ("1", "true", "yes", "on")
-    return os.getenv("EMU_DISABLE_CODE", "").lower() not in ("1", "true", "yes", "on")
-
-
-CODE_ENABLED = _code_enabled()
-ENABLE_EVAL = CODE_ENABLED  # back-compat alias for existing references
+# The `emu` tool runs code with the server process's authority. That is the
+# design -- it is how the model does anything -- so the server must be run
+# sandboxed (a container or VM). There is no enable/disable knob: running code
+# is what the tool is.
 
 # Where the model's self-built harness (the definitions it keeps) is persisted
 # so it survives server restarts, one file per kept definition.
@@ -3484,23 +3456,14 @@ def emu_call(
 
 @mcp.tool()
 def emu_eval(session_id: str, code: str) -> str:
-    """Run a Python snippet against a session (DISABLED unless opted in).
+    """Run a Python snippet against a session (internal; see the `emu` tool).
 
-    The snippet executes with `engine` (the wrapper), `native` (the underlying
-    emulator object), and `icicle`/`unicorn`/`qiling`/`angr` modules in scope.
-    Assign to `result` or end with an expression to return a value; anything
-    printed is captured.
-
-    This runs arbitrary Python in the server process and is therefore OFF by
-    default. Enable it only in a trusted, local setup by starting the server
-    with the environment variable EMU_ENABLE_EVAL=1.
+    Thin wrapper over the same persistent harness `emu` uses, kept for callers of
+    the legacy name. `emu(code=..., session_id=...)` is the real interface.
 
     session_id: Active session ID.
     code: Python source to execute.
     """
-    # emu_eval shares the single persistent harness namespace used by
-    # emu(action="code"), so definitions made through either are reusable from
-    # the other. Gating (EMU_ENABLE_EVAL) is enforced inside _run_harness.
     return _run_harness(code, session_id=session_id)
 
 
@@ -3523,7 +3486,7 @@ def _raw(name: str):
 # is also written to HARNESS_DIR so it reloads on the next start -- the model
 # accretes its own harness, like a living image, instead of being handed a fixed
 # set of verbs. This is in-process arbitrary Python with the server's authority,
-# so run the server sandboxed; CODE_ENABLED gates it (on by default).
+# so run the server sandboxed.
 _HARNESS_NS: dict = {}
 _HARNESS_ERRORS: list[str] = []
 import ast as _ast  # module-level: used by persistence + last-value eval
@@ -3687,19 +3650,14 @@ def _exec_with_last_value(code: str, ns: dict, buf):
         last_expr = _ast.Expression(tree.body.pop().value)
     with contextlib.redirect_stdout(buf):
         if tree.body:
-            exec(compile(tree, "<emu>", "exec"), ns)  # noqa: S102 — gated by CODE_ENABLED
+            exec(compile(tree, "<emu>", "exec"), ns)  # noqa: S102 — the server's one tool runs code
         if last_expr is not None:
             return eval(compile(last_expr, "<emu>", "eval"), ns)  # noqa: S307
     return None
 
 
 def _run_harness(code: str, session_id: str = "", strings: dict | None = None) -> str:
-    """Execute `code` in the persistent harness namespace (gated by CODE_ENABLED)."""
-    if not CODE_ENABLED:
-        return ("Error: code execution is disabled (EMU_DISABLE_CODE). `emu` runs arbitrary "
-                "Python with the server's authority; enable it only in a sandboxed setup "
-                "(container/VM) by not setting EMU_DISABLE_CODE. For a code-free deployment, "
-                "set EMU_EXPOSE_TYPED_TOOLS=1 to use the explicit typed verbs instead.")
+    """Execute `code` in the persistent harness namespace."""
     import io
     ns = _harness_ns()
     if session_id:
@@ -3765,14 +3723,10 @@ def emu(code: str = "", session_id: str = "", strings: dict | None = None) -> st
                                "poke(0x1000, S['x'])", strings={"x":"9090"})
       emu(session_id=sid, code="poke(0x1004,'cafe')")              # poke persisted — reused
 
-    This executes arbitrary Python with the server's authority, so run the server
-    sandboxed (a container/VM). It is ON by default; EMU_DISABLE_CODE=1 turns it
-    off (then set EMU_EXPOSE_TYPED_TOOLS=1 to use the explicit typed verbs
-    instead). EMU_EXPOSE_TYPED_TOOLS=1 also advertises those verbs alongside `emu`.
+    This executes arbitrary Python with the server's authority -- that is how the
+    tool works -- so run the server sandboxed (a container/VM).
     """
     if not code.strip():
-        if not CODE_ENABLED:
-            return _run_harness("", session_id=session_id)  # returns the disabled notice
         ns = _harness_ns()
         manual = ns["man"]()
         extra = (f"\n\nNote: {len(_HARNESS_ERRORS)} kept definition(s) failed to load: "

@@ -340,12 +340,12 @@ registers).
 
 ### Tool surface: one code tool
 
-A fixed catalog of ~70 typed verbs is the wrong interface — engines, archs and
+The interface is **one tool, `emu`** — there is no catalog of verbs and no flag
+to turn one on. A fixed catalog is the wrong interface: engines, archs and
 installs each support a different subset, and models differ in which tools they
 have and how well they use them, so privileging any hand-picked set biases the
-system. By **default the server advertises exactly one tool, `emu`**, which runs
-Python in a **persistent namespace**. The model writes code against a live API
-and builds its own tooling, instead of being handed verbs:
+system. `emu` runs Python in a **persistent namespace**; the model writes code
+against a live API and builds its own tooling:
 
 ```
 emu(code="")                                  # the manual + installed engines
@@ -369,15 +369,10 @@ because each definition is written to `HARNESS_DIR` (default
 `~/.emulation-mcp/harness`, one file per definition) — reloaded after a restart.
 So the model accretes a harness suited to the task and to how it works.
 
-Code runs with the server's authority, so **run the server sandboxed** (a
-container/VM). It is **on by default**; `EMU_DISABLE_CODE=1` turns it off (then
-set `EMU_EXPOSE_TYPED_TOOLS=1` to use the explicit typed verbs instead).
-
-Set **`EMU_EXPOSE_TYPED_TOOLS=1`** to additionally advertise the full catalog of
-explicit `emu_*` verbs (for clients/models that prefer discoverable, typed
-verbs). Every `emu_*` function exists regardless and is reachable from code
-(e.g. `engine.symbolize(addr)`), so no capability is lost when the catalog is
-hidden.
+Running code is what the tool is — it executes with the server's authority, so
+**run the server sandboxed** (a container/VM). The `emu_*` names in
+`CAPABILITIES.md` are the engine methods you call from `emu` code
+(e.g. `engine.symbolize(addr)`), not separate tools.
 
 ## Architecture
 

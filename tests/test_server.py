@@ -50,22 +50,18 @@ import shutil as _shutil
 
 _HARNESS_TMP = None
 _SAVED_HARNESS_DIR = None
-_SAVED_CODE_ENABLED = None
 
 
 def setUpModule():
-    global _HARNESS_TMP, _SAVED_HARNESS_DIR, _SAVED_CODE_ENABLED
+    global _HARNESS_TMP, _SAVED_HARNESS_DIR
     _HARNESS_TMP = _tempfile.mkdtemp(prefix="emu-harness-test-")
     _SAVED_HARNESS_DIR = server.HARNESS_DIR
-    _SAVED_CODE_ENABLED = server.CODE_ENABLED
     server.HARNESS_DIR = _HARNESS_TMP
-    server.CODE_ENABLED = True
     server._HARNESS_NS.clear()
 
 
 def tearDownModule():
     server.HARNESS_DIR = _SAVED_HARNESS_DIR
-    server.CODE_ENABLED = _SAVED_CODE_ENABLED
     server._HARNESS_NS.clear()
     if _HARNESS_TMP:
         _shutil.rmtree(_HARNESS_TMP, ignore_errors=True)
@@ -273,20 +269,8 @@ class TestReflectiveTools(unittest.TestCase):
         finally:
             _fn(server.emu_close_session)(sid)
 
-    def test_eval_refused_when_code_disabled(self):
-        # Code execution is ON by default now; when turned off it refuses clearly.
-        saved = server.CODE_ENABLED
-        server.CODE_ENABLED = False
-        sid = _new_session(engine="unicorn", arch="x86_64")
-        try:
-            out = _fn(server.emu_eval)(sid, "result = 1 + 1")
-            self.assertIn("disabled", out.lower())
-        finally:
-            _fn(server.emu_close_session)(sid)
-            server.CODE_ENABLED = saved
-
-    def test_eval_when_enabled(self):
-        # setUpModule enables code; emu_eval shares the persistent harness.
+    def test_eval_runs_in_shared_harness(self):
+        # emu_eval is a thin wrapper over the same persistent harness `emu` uses.
         sid = _new_session(engine="unicorn", arch="x86_64")
         try:
             out = _fn(server.emu_eval)(sid,
@@ -331,8 +315,6 @@ class TestExtendedIcicleTools(unittest.TestCase):
 
     def test_callback_hook_via_eval(self):
         """Python-callback hooks are driveable through emu_eval."""
-        orig = server.ENABLE_EVAL
-        server.ENABLE_EVAL = True
         sid = _new_session(engine="icicle", arch="x86_64")
         try:
             caps = server.sessions.get(sid).CAPABILITIES
@@ -349,12 +331,8 @@ class TestExtendedIcicleTools(unittest.TestCase):
             self.assertNotIn("result: 0", out)
         finally:
             _fn(server.emu_close_session)(sid)
-            server.ENABLE_EVAL = orig
-
     def test_memory_hook_via_eval(self):
         """Guest memory-access hooks are driveable through emu_eval."""
-        orig = server.ENABLE_EVAL
-        server.ENABLE_EVAL = True
         sid = _new_session(engine="icicle", arch="x86_64")
         try:
             caps = server.sessions.get(sid).CAPABILITIES
@@ -375,8 +353,6 @@ class TestExtendedIcicleTools(unittest.TestCase):
             self.assertIn("0x8000000:efbeadde", out)
         finally:
             _fn(server.emu_close_session)(sid)
-            server.ENABLE_EVAL = orig
-
     def test_pcode_via_server(self):
         sid = _new_session(engine="icicle", arch="x86_64")
         try:
@@ -391,8 +367,6 @@ class TestExtendedIcicleTools(unittest.TestCase):
 
     def test_mmio_via_eval(self):
         """MMIO regions are driveable through emu_eval (callbacks)."""
-        orig = server.ENABLE_EVAL
-        server.ENABLE_EVAL = True
         sid = _new_session(engine="icicle", arch="x86_64")
         try:
             if "mmio" not in server.sessions.get(sid).CAPABILITIES:
@@ -406,8 +380,6 @@ class TestExtendedIcicleTools(unittest.TestCase):
             self.assertIn("0x11223344", out)
         finally:
             _fn(server.emu_close_session)(sid)
-            server.ENABLE_EVAL = orig
-
     def test_pcode_rejected_on_unicorn(self):
         sid = _new_session(engine="unicorn", arch="x86_64")
         try:
@@ -706,8 +678,6 @@ class TestAngrThroughServer(unittest.TestCase):
 
     def test_inspect_hook_via_eval(self):
         """state.inspect breakpoints are driveable through emu_eval."""
-        orig = server.ENABLE_EVAL
-        server.ENABLE_EVAL = True
         sid = _new_session(engine="angr", arch="x86_64")
         try:
             out = _fn(server.emu_eval)(sid,
@@ -719,8 +689,6 @@ class TestAngrThroughServer(unittest.TestCase):
             self.assertIn("0x8000000", out)
         finally:
             _fn(server.emu_close_session)(sid)
-            server.ENABLE_EVAL = orig
-
     def test_new_tools_rejected_on_unicorn(self):
         sid = _new_session(engine="unicorn", arch="x86_64")
         try:
@@ -873,18 +841,11 @@ class TestToolSurface(unittest.TestCase):
         out = _fn(server.emu)(code=f"create(**{opts!r})")
         return out.split("result:", 1)[1].strip().strip("'\"")
 
-    def test_only_emu_advertised_by_default(self):
-        names = self._advertised()
-        self.assertIn("emu", names)
-        if server._EXPOSE_TYPED:
-            # Flag on: the full catalog is advertised alongside emu.
-            self.assertIn("emu_symbolize", names)
-            self.assertIn("emu_create_session", names)
-        else:
-            # Default: exactly one tool.
-            self.assertEqual(names, {"emu"})
-        # Every typed function stays defined on the module regardless, so it is
-        # reachable (via code / emu_call) and importable by tests.
+    def test_emu_is_the_only_tool(self):
+        # `emu` is the whole interface: exactly one advertised tool, always.
+        self.assertEqual(self._advertised(), {"emu"})
+        # The other emu_* names stay defined on the module as plain functions
+        # (the harness and tests call them); they are just not tools.
         self.assertTrue(callable(_fn(server.emu_create_session)))
         self.assertTrue(callable(_fn(server.emu_symbolize)))
 
@@ -925,16 +886,6 @@ class TestToolSurface(unittest.TestCase):
         self.assertIn("42", _fn(server.emu)(code="answer()"))
         _fn(server.emu)(code="forget('answer')")        # clean up
         self.assertNotIn("answer", _fn(server.emu)(code="kept()"))
-
-    def test_code_disabled_refuses_clearly(self):
-        saved = server.CODE_ENABLED
-        server.CODE_ENABLED = False
-        try:
-            out = _fn(server.emu)(code="1+1")
-            self.assertIn("disabled", out.lower())
-            self.assertIn("EMU_DISABLE_CODE", out)
-        finally:
-            server.CODE_ENABLED = saved
 
 
 if __name__ == "__main__":
